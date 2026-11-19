@@ -255,6 +255,7 @@ try {
     Check (Test-Path -LiteralPath $claudeSource) 'rollback preview leaves the junction'
     Check (Test-Path -LiteralPath $claudeHold) 'rollback preview leaves the hold'
     Check ((Read-Entry 'claude').state -eq 'Activated') 'rollback preview leaves the state alone'
+    Check ($null -eq (Read-Entry 'claude').PSObject.Properties['destinationSnapshot']) 'rollback preview records no snapshot'
 
     $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-DriveLetter', $rootLetter) -ExpectFailure
     Check-Text $out 'ConfirmAgentsStopped' 'rollback requires the stopped-agent switch'
@@ -285,6 +286,22 @@ try {
     Check ($snapshot.StartsWith((Join-Path $root 'migration\rollbacks'), [StringComparison]::OrdinalIgnoreCase)) 'snapshot lives under migration\rollbacks'
     Check (Test-Path -LiteralPath (Join-Path $snapshot 'added.txt')) 'snapshot contains the added file'
     Check ((Get-Content -LiteralPath (Join-Path $snapshot 'settings.json') -Raw) -match 'lite') 'snapshot contains the changed file'
+    Check (-not [string]::IsNullOrWhiteSpace($rolledBack.destinationSnapshotHash)) 'rollback records the snapshot hash'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status accepts an intact destination snapshot'
+
+    $snapshotAway = $snapshot + '.away'
+    Rename-Item -LiteralPath $snapshot -NewName ([IO.Path]::GetFileName($snapshotAway))
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'destination snapshot missing' 'status reports a missing destination snapshot'
+    Rename-Item -LiteralPath $snapshotAway -NewName ([IO.Path]::GetFileName($snapshot))
+
+    Add-File (Join-Path $snapshot 'intruder.txt') 'tampered'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'destination snapshot corrupted' 'status reports a corrupted destination snapshot'
+    Remove-Item -LiteralPath (Join-Path $snapshot 'intruder.txt') -Force
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status agrees again after the snapshot restore'
 
     # Reconcile the destination and activate again for the later cleanup cases.
     Remove-Item -LiteralPath (Join-Path $claudeDest 'added.txt') -Force
