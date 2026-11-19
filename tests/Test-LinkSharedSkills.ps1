@@ -13,6 +13,12 @@
     4. forced failure   - denies CreateDirectories on one agent's skills directory so
                           New-Item -ItemType Junction raises a real access-denied error,
                           exercising the LINK FAILED branch and its registry entry
+    5. partial failure  - adds an agent that sorts first and links successfully while the
+                          deny rule from scenario 4 is still in place, so one run both
+                          creates links and reports a failure
+    6. partial failure  - re-enables claude's skills directory and adds a shared skill whose
+                          trailing dot only survives through a \\?\ path, so the junction
+                          target cannot resolve: one link is created, the next fails
 
   Nothing outside the scratch root and the temp profile is touched; the deny rule is
   removed and both trees deleted at the end. Exit code 0 means every check passed.
@@ -37,6 +43,7 @@ $claudeHome = Join-Path $root 'agents\claude'
 $cursorHome = Join-Path $root 'agents\cursor'
 $claudeSkills = Join-Path $claudeHome 'skills'
 $linksPath = Join-Path $root 'registry\skill-links.json'
+$dotSkill = Join-Path $root 'shared\skills\zz-dot.'
 $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 
 $script:checks = 0
@@ -168,11 +175,75 @@ try {
     Check ($claude.status -eq 'LINK FAILED') 'registry records LINK FAILED'
     Check (@($claude.linked) -contains 'shared-demo') 'registry keeps the link that already existed'
     Check (@($claude.createdThisRun).Count -eq 0) 'registry records nothing created this run'
+
+    Write-Host ''
+    Write-Host '=== 5. partial failure across agents ==='
+    # aider sorts before claude, so its links are created before claude reaches the
+    # deny rule that scenario 4 left on claude's skills directory.
+    $aiderHome = Join-Path $root 'agents\aider'
+    $aiderSkills = Join-Path $aiderHome 'skills'
+    New-Item -ItemType Directory -Path $aiderSkills -Force | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $profileDir '.aider') -Target $aiderHome | Out-Null
+    $manifestPath = Join-Path $root 'registry\migration-manifest.json'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $manifest.entries = @($manifest.entries) + [pscustomobject]@{
+        id = 'aider'; source = (Join-Path $profileDir '.aider'); destination = $aiderHome; state = 'active'
+    }
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+    $out = Invoke-LinkScript @('-Apply')
+    Write-Host $out
+    Check-Text $out 'CONFIRMED (+3 linked)' 'reports the links created before the failure'
+    Check-Text $out 'links created=3' 'counts the links that were created'
+    Check-Text $out 'failed=1' 'counts the later failure'
+    Check ((Test-Path -LiteralPath (Join-Path $aiderSkills 'shared-demo\SKILL.md'))) 'earlier link survives the later failure'
+    Check (-not (Test-Path -LiteralPath (Join-Path $claudeSkills 'zz-fail'))) 'denied agent still has no link'
+    $reg = Get-Content -LiteralPath $linksPath -Raw | ConvertFrom-Json
+    $aider = $reg.agents | Where-Object { $_.id -eq 'aider' }
+    $claude = $reg.agents | Where-Object { $_.id -eq 'claude' }
+    Check ($aider.status -eq 'CONFIRMED') 'registry keeps the earlier agent confirmed'
+    Check (@($aider.createdThisRun).Count -eq 3) 'registry records the earlier links'
+    Check ($claude.status -eq 'LINK FAILED') 'registry records the later failure'
+    Check (@($claude.createdThisRun).Count -eq 0) 'registry credits nothing to the failed agent'
+
+    Write-Host ''
+    Write-Host '=== 6. partial failure in one agent ==='
+    # Undo scenarios 4 and 5, then let claude link again from scratch.
+    Set-CreateDirectoriesDeny $claudeSkills -Remove
+    $denyActive = $false
+    [IO.Directory]::Delete((Join-Path $claudeSkills 'shared-demo'))
+    [IO.Directory]::Delete((Join-Path $profileDir '.aider'))
+    Remove-Item -LiteralPath (Join-Path $root 'shared\skills\zz-fail') -Recurse -Force
+    $manifestPath = Join-Path $root 'registry\migration-manifest.json'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $manifest.entries = @($manifest.entries | Where-Object { $_.id -ne 'aider' })
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+    # A trailing dot passes through only when the name bypasses Win32, so New-Item resolves
+    # the junction target to a name that does not exist and throws; the first link succeeds.
+    [IO.Directory]::CreateDirectory('\\?\' + $dotSkill) | Out-Null
+    $out = Invoke-LinkScript @('-Apply')
+    Write-Host $out
+    Check-Text $out 'LINK FAILED (+1 linked)' 'labels the partial failure with its linked count'
+    Check-Text $out 'linked    : shared-demo' 'names the link created before the failure'
+    Check-Text $out 'failed    : zz-dot.' 'names the skill that failed'
+    Check-Text $out 'links created=1' 'counts the one link created'
+    Check-Text $out 'failed=1' 'counts the one failure'
+    Check ((Test-Path -LiteralPath (Join-Path $claudeSkills 'shared-demo\SKILL.md'))) 'created link survives the failure'
+    $reg = Get-Content -LiteralPath $linksPath -Raw | ConvertFrom-Json
+    $claude = $reg.agents | Where-Object { $_.id -eq 'claude' }
+    Check ($claude.status -eq 'LINK FAILED') 'registry records LINK FAILED with the link'
+    Check (@($claude.createdThisRun) -contains 'shared-demo') 'registry credits the created link'
+    Check (@($claude.linked) -contains 'shared-demo') 'registry still reports the link'
+    Check (@($claude.skipped) -contains 'private-skill') 'registry keeps the skipped collision'
 }
 finally {
     if ($denyActive) {
         try { Set-CreateDirectoriesDeny $claudeSkills -Remove } catch { Write-Host "WARNING: $($_.Exception.Message)" -ForegroundColor Yellow }
     }
+    # A trailing-dot name cannot be removed through a Win32 path; drop it explicitly.
+    try { [IO.Directory]::Delete('\\?\' + $dotSkill, $true) }
+    catch [System.IO.DirectoryNotFoundException] { }
+    catch { Write-Host "WARNING: could not remove $dotSkill : $($_.Exception.Message)" -ForegroundColor Yellow }
     foreach ($p in @($root, $profileDir)) {
         if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }
     }

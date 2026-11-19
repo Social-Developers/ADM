@@ -159,6 +159,14 @@ For a dry run before activation exists, classify unlinked homes explicitly:
 .\scripts\Link-SharedSkills.ps1 -IncludeHome "$env:USERPROFILE\.claude;$env:USERPROFILE\.codex"
 ```
 
+To exercise the linker without touching live agent directories, run the scratch harness:
+
+```powershell
+powershell -NoProfile -File tests\Test-LinkSharedSkills.ps1
+```
+
+It builds a throwaway root under `<scratch drive>:\_admtest\agents` (default `Q:`, override with `-DriveLetter`) and a temporary profile under `%TEMP%\adm-link-harness-profile`, then runs the linker against them in child processes. It covers report-only, apply, idempotent re-apply, a forced junction failure, a partial run where earlier links are created before a later agent fails, and a same-agent partial failure that produces the `LINK FAILED (+N linked)` label. The temporary ACL deny rule and both trees are removed at the end; exit code 0 means every check passed.
+
 ### 7. Cleanup (optional, destructive)
 
 **Only after independent operational testing**, identify the exact hold directories proposed for deletion and explicitly approve them. Supply an existing backup root on an independent device; `R:` below is just an example:
