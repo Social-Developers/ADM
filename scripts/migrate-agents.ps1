@@ -361,6 +361,12 @@ switch ($Phase) {
                 if ($WhatIfPreference) { Write-Host ("  note      : changed destination would be kept at {0}" -f $e.destination) }
                 else { Write-Warning "Destination changed since activation; keeping the changed destination at $($e.destination)." }
             }
+            if ($diffCount -gt 0 -and $AcceptDestinationChanges -and -not $WhatIfPreference) {
+                $snapshot = Join-Path (Join-Path $script:Root 'migration\rollbacks') ($e.id + '-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'))
+                Copy-Tree $e.destination $snapshot
+                $e | Add-Member -NotePropertyName destinationSnapshot -NotePropertyValue $snapshot -Force
+                Write-Host "Destination snapshot: $snapshot"
+            }
             $sourceExists = Test-Path -LiteralPath $e.source
             if ($sourceExists) {
                 $link = Get-Item -LiteralPath $e.source -Force
