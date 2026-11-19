@@ -246,11 +246,28 @@ try {
     Check-Text $out 'Cannot roll back gemini in state Inventoried' 'rollback refuses an agent that was never activated'
     Check ((Read-Entry 'cursor').state -eq 'Activated') 'refused rollback leaves the state alone'
 
-    # A destination that changed since activation must not be stranded by a rollback.
+    # A destination that changed since activation needs the explicit override.
     Set-Content -LiteralPath $claudeSettings -Value '{"theme":"lite"}'
+    Add-File (Join-Path $claudeDest 'added.txt') 'new data'
     $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-DriveLetter', $rootLetter) -ExpectFailure
     Check-Text $out 'Destination changed since activation' 'rollback refuses a changed destination'
+    Check-Text $out 'destination differs' 'rollback summarizes the changed destination'
+    Check-Text $out 'added=1 removed=0 changed=1' 'counts the added and changed files'
+    Check ((Read-Entry 'claude').state -eq 'Activated') 'refused rollback keeps claude Activated'
+
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-AcceptDestinationChanges', '-DriveLetter', $rootLetter)
+    Check (-not (Test-Path -LiteralPath $claudeHold)) 'accepted rollback restores the hold'
+    Check (Test-Path -LiteralPath (Join-Path $claudeDest 'added.txt')) 'accepted rollback preserves the changed destination'
+    $rolledBack = Read-Entry 'claude'
+    Check ($rolledBack.rolledBackWithChanges -eq $true) 'rollback records the changed destination'
+    Check ($rolledBack.destinationChanges.added -eq 1 -and $rolledBack.destinationChanges.changed -eq 1) 'rollback records the change counts'
+    Check ($rolledBack.state -eq 'Verified') 'accepted rollback returns the entry to Verified'
+
+    # Reconcile the destination and activate again for the later cleanup cases.
+    Remove-Item -LiteralPath (Join-Path $claudeDest 'added.txt') -Force
     Set-Content -LiteralPath $claudeSettings -Value '{"theme":"dark"}'
+    $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
+    Check ((Read-Entry 'claude').state -eq 'Activated') 'reconciled agent can be activated again'
 
     # Only a junction known to point at this destination may be removed.
     [IO.Directory]::Delete($claudeSource)
