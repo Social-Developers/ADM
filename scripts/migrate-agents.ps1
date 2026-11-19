@@ -120,6 +120,35 @@ function Get-TreeDiff([string]$Reference, [string]$Current) {
         added = @($added | Sort-Object); removed = @($removed | Sort-Object); changed = @($changed | Sort-Object)
     }
 }
+function Get-TreeDigest([string]$Path) {
+    Assert-TreeSafe $Path
+    $lines = @(Files-In $Path | ForEach-Object {
+            $rel = (Relative $Path $_.FullName).Replace('\', '/').ToLowerInvariant()
+            "$rel|$($_.Length)|$(FileHash $_.FullName)"
+        })
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes((@($lines) -join "`n"))
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+    } finally { $sha.Dispose() }
+}
+function Get-SnapshotProblems([object]$E) {
+    $property = $E.PSObject.Properties['destinationSnapshot']
+    if ($null -eq $property) { return @() }
+    $snapText = [string]$property.Value
+    if ([string]::IsNullOrWhiteSpace($snapText)) { return @('destination snapshot path missing') }
+    $rollbacks = Join-Path $script:Root 'migration\rollbacks'
+    try { $snap = FullPath $snapText } catch { return @('destination snapshot path invalid') }
+    if ($snap -ieq (FullPath $rollbacks) -or -not (IsWithin $snap $rollbacks)) { return @('destination snapshot outside rollbacks') }
+    if (-not (Test-Path -LiteralPath $snap -PathType Container)) { return @('destination snapshot missing') }
+    $hashProperty = $E.PSObject.Properties['destinationSnapshotHash']
+    if ($null -eq $hashProperty -or [string]::IsNullOrWhiteSpace([string]$hashProperty.Value)) { return @('destination snapshot hash missing') }
+    try {
+        $actual = Get-TreeDigest $snap
+    } catch { return @('destination snapshot unreadable') }
+    if ($actual -ne ([string]$hashProperty.Value).ToLowerInvariant()) { return @('destination snapshot corrupted') }
+    return @()
+}
 function Copy-Tree([string]$Source, [string]$Destination) {
     Assert-TreeSafe $Source
     Assert-Condition (-not (Test-Path -LiteralPath $Destination)) "Destination exists; refusing overwrite: $Destination"
@@ -257,6 +286,7 @@ switch ($Phase) {
                 }
             }
             if ($destination -eq 'missing' -and $e.state -ne 'Inventoried') { $problems += 'destination missing or unavailable' }
+            $problems += @(Get-SnapshotProblems $e)
             switch ($e.state) {
                 { $_ -in @('Activated', 'BackupVerified') } {
                     if ($legacy -eq 'missing') { $problems += 'legacy junction missing' }
@@ -365,6 +395,7 @@ switch ($Phase) {
                 $snapshot = Join-Path (Join-Path $script:Root 'migration\rollbacks') ($e.id + '-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'))
                 Copy-Tree $e.destination $snapshot
                 $e | Add-Member -NotePropertyName destinationSnapshot -NotePropertyValue $snapshot -Force
+                $e | Add-Member -NotePropertyName destinationSnapshotHash -NotePropertyValue (Get-TreeDigest $snapshot) -Force
                 Write-Host "Destination snapshot: $snapshot"
             }
             $sourceExists = Test-Path -LiteralPath $e.source
