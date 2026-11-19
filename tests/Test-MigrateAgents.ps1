@@ -280,12 +280,18 @@ try {
     Check ($rolledBack.rolledBackWithChanges -eq $true) 'rollback records the changed destination'
     Check ($rolledBack.destinationChanges.added -eq 1 -and $rolledBack.destinationChanges.changed -eq 1) 'rollback records the change counts'
     Check ($rolledBack.state -eq 'Verified') 'accepted rollback returns the entry to Verified'
+    $snapshot = $rolledBack.destinationSnapshot
+    Check (-not [string]::IsNullOrWhiteSpace($snapshot)) 'rollback records the destination snapshot'
+    Check ($snapshot.StartsWith((Join-Path $root 'migration\rollbacks'), [StringComparison]::OrdinalIgnoreCase)) 'snapshot lives under migration\rollbacks'
+    Check (Test-Path -LiteralPath (Join-Path $snapshot 'added.txt')) 'snapshot contains the added file'
+    Check ((Get-Content -LiteralPath (Join-Path $snapshot 'settings.json') -Raw) -match 'lite') 'snapshot contains the changed file'
 
     # Reconcile the destination and activate again for the later cleanup cases.
     Remove-Item -LiteralPath (Join-Path $claudeDest 'added.txt') -Force
     Set-Content -LiteralPath $claudeSettings -Value '{"theme":"dark"}'
     $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
     Check ((Read-Entry 'claude').state -eq 'Activated') 'reconciled agent can be activated again'
+    Check (Test-Path -LiteralPath (Join-Path $snapshot 'added.txt')) 'snapshot survives later destination reconciliation'
 
     # A destination missing a file must be reported as removed and still preserved.
     Remove-Item -LiteralPath $claudeSettings -Force
@@ -299,6 +305,8 @@ try {
     Check (Test-Path -LiteralPath (Join-Path $claudeSource 'settings.json')) 'accepted rollback restores the missing source file'
     $removedEntry = Read-Entry 'claude'
     Check ($removedEntry.destinationChanges.removed -eq 1) 'rollback records the removed file count'
+    Check ($removedEntry.destinationSnapshot -ne $snapshot) 'each accepted rollback gets its own snapshot'
+    Check (-not (Test-Path -LiteralPath (Join-Path $removedEntry.destinationSnapshot 'settings.json'))) 'snapshot captures the removed file state'
     Check ($removedEntry.state -eq 'Verified') 'removed-file rollback returns the entry to Verified'
     Set-Content -LiteralPath $claudeSettings -Value '{"theme":"dark"}'
     $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
@@ -325,6 +333,7 @@ try {
     Check (Test-Path -LiteralPath (Join-Path $cursorDest 'notes.txt')) 'rollback leaves the destination in place'
     Check ((Read-Entry 'cursor').state -eq 'Verified') 'rollback returns the entry to Verified'
     Check (-not [string]::IsNullOrWhiteSpace((Read-Entry 'cursor').rolledBackUtc)) 'rollback records when it happened'
+    Check ($null -eq (Read-Entry 'cursor').PSObject.Properties['destinationSnapshot']) 'unchanged rollback creates no snapshot'
 
     # Half-rollback: junction already gone, hold still present, state still Activated.
     $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
