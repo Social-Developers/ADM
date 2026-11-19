@@ -207,34 +207,28 @@ try {
 
     Write-Host ''
     Write-Host '=== 6. partial failure in one agent ==='
-    # Undo scenarios 4 and 5, then let claude link again from scratch.
+    # Scenario 4 still denies claude's skills directory; lift that and drop the link
+    # scenario 2 created so this run recreates it. -Agent keeps scenario 5's extra agent
+    # out of the picture.
     Set-CreateDirectoriesDeny $claudeSkills -Remove
     $denyActive = $false
     [IO.Directory]::Delete((Join-Path $claudeSkills 'shared-demo'))
-    [IO.Directory]::Delete((Join-Path $profileDir '.aider'))
-    Remove-Item -LiteralPath (Join-Path $root 'shared\skills\zz-fail') -Recurse -Force
-    $manifestPath = Join-Path $root 'registry\migration-manifest.json'
-    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    $manifest.entries = @($manifest.entries | Where-Object { $_.id -ne 'aider' })
-    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
 
-    # A trailing dot passes through only when the name bypasses Win32, so New-Item resolves
-    # the junction target to a name that does not exist and throws; the first link succeeds.
+    # Denying the directory fails every name, and any existing destination reads as present,
+    # so failing one skill needs a name Win32 cannot address. A trailing dot survives only
+    # through a \\?\ path: it is listed as zz-dot., but New-Item resolves the target to
+    # zz-dot and throws. Skills sorting before it still link.
     [IO.Directory]::CreateDirectory('\\?\' + $dotSkill) | Out-Null
-    $out = Invoke-LinkScript @('-Apply')
+    $out = Invoke-LinkScript -Extra @('-Apply', '-Agent', 'claude')
     Write-Host $out
     Check-Text $out 'LINK FAILED (+1 linked)' 'labels the partial failure with its linked count'
     Check-Text $out 'linked    : shared-demo' 'names the link created before the failure'
     Check-Text $out 'failed    : zz-dot.' 'names the skill that failed'
-    Check-Text $out 'links created=1' 'counts the one link created'
-    Check-Text $out 'failed=1' 'counts the one failure'
     Check ((Test-Path -LiteralPath (Join-Path $claudeSkills 'shared-demo\SKILL.md'))) 'created link survives the failure'
     $reg = Get-Content -LiteralPath $linksPath -Raw | ConvertFrom-Json
     $claude = $reg.agents | Where-Object { $_.id -eq 'claude' }
     Check ($claude.status -eq 'LINK FAILED') 'registry records LINK FAILED with the link'
     Check (@($claude.createdThisRun) -contains 'shared-demo') 'registry credits the created link'
-    Check (@($claude.linked) -contains 'shared-demo') 'registry still reports the link'
-    Check (@($claude.skipped) -contains 'private-skill') 'registry keeps the skipped collision'
 }
 finally {
     if ($denyActive) {

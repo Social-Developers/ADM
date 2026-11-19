@@ -134,6 +134,15 @@ $linkScript = Join-Path $skillDirectory 'scripts\Link-SharedSkills.ps1'
 
 Always run the report-only form first and read the `CONFIRMED` / `UNCONFIRMED` / `BLOCKED` table. Run the helper only after `Activate`, or use `-IncludeHome` for a dry run against unlinked homes. Never invent a skills path for an `UNCONFIRMED` agent: confirm the real location from that agent's own documentation, then pass it with `-IncludeHome` to see how it classifies before linking. Results are recorded in `<DRIVE>:\agents\registry\skill-links.json`.
 
+To exercise the linker without touching real agent directories, run the bundled scratch harness:
+
+```powershell
+$harness = Join-Path $skillDirectory 'tests\Test-LinkSharedSkills.ps1'
+& $harness                      # scratch volume Q: by default; -DriveLetter overrides it
+```
+
+It builds a throwaway root under `<scratch drive>:\_admtest\agents` and a temporary profile under `%TEMP%\adm-link-harness-profile`, then runs the linker against them in child processes. It covers report-only, apply, idempotent re-apply, a forced junction failure, a cross-agent partial run and a same-agent partial failure whose output carries `LINK FAILED (+N linked)`. The ACL deny rule and both trees are removed at the end, and nothing outside the scratch root and temp profile is touched; exit code 0 means every check passed. Run it only after confirming the harness exists in the skill's `tests\` folder; if it is missing, report that instead of reconstructing it.
+
 Never replace agent-private skills with shared copies based solely on matching names, and do not copy credentials, private memories, or sessions into the shared pool. Agents with this skill should prefer `<DRIVE>:\agents` for supported persistent data and respect the legacy junctions. Do not promise universal enforcement across agents that do not have the skill installed or do not support relocation.
 
 ## Recovery and error handling
