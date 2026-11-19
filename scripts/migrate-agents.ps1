@@ -15,7 +15,7 @@
   .\migrate-agents.ps1 -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback
   .\migrate-agents.ps1 -Phase Cleanup -Agent claude -BackupRoot 'R:\agent-migration-backup' -ConfirmAgentsValidated -ApproveDeletion
 #>
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [ValidateSet('Inventory','Copy','Verify','Activate','Rollback','Cleanup','Status')]
     [string]$Phase = 'Inventory',
@@ -71,7 +71,13 @@ function Load-Json([string]$Path) {
     Assert-Condition (Test-Path -LiteralPath $Path -PathType Leaf) "Missing manifest: $Path. Run Inventory first."
     return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json)
 }
-function FileHash([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
+function FileHash([string]$Path) {
+    # Hashed directly so -WhatIf cannot suppress the read the way it does for Get-FileHash.
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
 function Files-In([string]$Path) {
     @(Get-ChildItem -LiteralPath $Path -Force -Recurse -File -ErrorAction Stop | Sort-Object FullName)
 }
@@ -300,12 +306,17 @@ switch ($Phase) {
         break
     }
     'Activate' {
-        Assert-Condition $ConfirmAgentsStopped 'Close affected agents and pass -ConfirmAgentsStopped.'
+        if (-not $WhatIfPreference) { Assert-Condition $ConfirmAgentsStopped 'Close affected agents and pass -ConfirmAgentsStopped.' }
         foreach ($e in $entries) {
             Assert-Condition ($e.state -eq 'Verified') "Agent $($e.id) must be Verified before activation."
             Assert-Condition (-not (Test-Path -LiteralPath $e.hold)) "Hold already exists: $($e.hold)"
             Assert-TreeSafe $e.source
             Assert-EqualTrees $e.source $e.destination
+            if ($WhatIfPreference) {
+                [void]$PSCmdlet.ShouldProcess($e.source, "Rename to $($e.hold) and link to $($e.destination)")
+                Write-Host ("would activate: {0} -> {1}" -f $e.source, $e.destination)
+                continue
+            }
             # Ensure source has not changed after verification before cutover.
             Rename-Item -LiteralPath $e.source -NewName ([IO.Path]::GetFileName($e.hold)) -ErrorAction Stop
             try {
@@ -326,8 +337,10 @@ switch ($Phase) {
         break
     }
     'Rollback' {
-        Assert-Condition $ConfirmAgentsStopped 'Close affected agents and pass -ConfirmAgentsStopped.'
-        Assert-Condition $ApproveRollback 'Explicit -ApproveRollback is required.'
+        if (-not $WhatIfPreference) {
+            Assert-Condition $ConfirmAgentsStopped 'Close affected agents and pass -ConfirmAgentsStopped.'
+            Assert-Condition $ApproveRollback 'Explicit -ApproveRollback is required.'
+        }
         foreach ($e in $entries) {
             Assert-Condition ($e.state -in @('Activated','BackupVerified')) "Cannot roll back $($e.id) in state $($e.state)"
             Assert-Condition (Test-Path -LiteralPath $e.hold -PathType Container) "Hold missing: $($e.hold)"
@@ -342,17 +355,26 @@ switch ($Phase) {
                     $items = @($diff.$kind)
                     if ($items.Count -gt 0) { Write-Host ("  {0,-8}: {1}" -f $kind, (($items | Select-Object -First 10) -join ', ')) }
                 }
-                if (-not $AcceptDestinationChanges) {
+                if (-not $AcceptDestinationChanges -and -not $WhatIfPreference) {
                     throw "Destination changed since activation; refusing rollback of $($e.id) without -AcceptDestinationChanges."
                 }
-                Write-Warning "Destination changed since activation; keeping the changed destination at $($e.destination)."
+                if ($WhatIfPreference) { Write-Host ("  note      : changed destination would be kept at {0}" -f $e.destination) }
+                else { Write-Warning "Destination changed since activation; keeping the changed destination at $($e.destination)." }
             }
-            if (Test-Path -LiteralPath $e.source) {
+            $sourceExists = Test-Path -LiteralPath $e.source
+            if ($sourceExists) {
                 $link = Get-Item -LiteralPath $e.source -Force
                 Assert-Condition (($link.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) 'Legacy path is not a junction; refusing rollback.'
                 Assert-Condition ($link.LinkType -eq 'Junction') 'Legacy path is not a junction; refusing rollback.'
                 $targets = @($link.Target)
                 Assert-Condition ($targets.Count -gt 0 -and (FullPath $targets[0]) -ieq (FullPath $e.destination)) 'Legacy junction points elsewhere; refusing rollback.'
+            }
+            if ($WhatIfPreference) {
+                [void]$PSCmdlet.ShouldProcess($e.source, "Remove junction and restore $($e.hold)")
+                Write-Host ("would roll back: {0} (destination kept at {1})" -f $e.source, $e.destination)
+                continue
+            }
+            if ($sourceExists) {
                 [IO.Directory]::Delete($e.source)
                 Assert-Condition (-not (Test-Path -LiteralPath $e.source)) 'Junction removal incomplete.'
             }
@@ -370,13 +392,17 @@ switch ($Phase) {
         break
     }
     'Cleanup' {
-        Assert-Condition $ConfirmAgentsValidated 'Manually test each agent startup, skills, memory and writes; then pass -ConfirmAgentsValidated.'
-        Assert-Condition $ApproveDeletion 'Explicit -ApproveDeletion is required.'
-        Assert-Condition (-not [string]::IsNullOrWhiteSpace($BackupRoot)) 'Independent -BackupRoot is required.'
-        $backup = FullPath $BackupRoot
-        Assert-Condition (Test-Path -LiteralPath $backup -PathType Container) 'BackupRoot must exist.'
-        Assert-Condition ((DriveId $backup) -ne (DriveId $script:Root)) 'Backup must be on a different drive than the destination.'
-        foreach ($e in $entries) { Assert-Condition ((DriveId $backup) -ne (DriveId $e.source)) 'Backup must also be on a different drive than each source.' }
+        if (-not $WhatIfPreference) {
+            Assert-Condition $ConfirmAgentsValidated 'Manually test each agent startup, skills, memory and writes; then pass -ConfirmAgentsValidated.'
+            Assert-Condition $ApproveDeletion 'Explicit -ApproveDeletion is required.'
+            Assert-Condition (-not [string]::IsNullOrWhiteSpace($BackupRoot)) 'Independent -BackupRoot is required.'
+        }
+        $backup = if ([string]::IsNullOrWhiteSpace($BackupRoot)) { '' } else { FullPath $BackupRoot }
+        if ($backup) {
+            Assert-Condition (Test-Path -LiteralPath $backup -PathType Container) 'BackupRoot must exist.'
+            Assert-Condition ((DriveId $backup) -ne (DriveId $script:Root)) 'Backup must be on a different drive than the destination.'
+            foreach ($e in $entries) { Assert-Condition ((DriveId $backup) -ne (DriveId $e.source)) 'Backup must also be on a different drive than each source.' }
+        }
         foreach ($e in $entries) {
             Assert-Condition ($e.state -in @('Activated','BackupVerified')) "Not activated: $($e.id)"
             Assert-Condition (Test-Path -LiteralPath $e.hold -PathType Container) "Hold missing: $($e.hold)"
@@ -386,7 +412,13 @@ switch ($Phase) {
             Assert-Condition ($junction.LinkType -eq 'Junction') 'Legacy path is not a junction.'
             Assert-Condition ((FullPath $junction.Target) -ieq (FullPath $e.destination)) 'Legacy junction points elsewhere.'
             Assert-EqualTrees $e.hold $e.destination
-            $backPath = Join-Path $backup ("agents-" + $e.id)
+            $backPath = if ($backup) { Join-Path $backup ("agents-" + $e.id) } else { '<BackupRoot>\agents-' + $e.id }
+            if ($WhatIfPreference) {
+                if ($e.state -eq 'Activated') { [void]$PSCmdlet.ShouldProcess($backPath, 'Copy verified hold to backup') }
+                [void]$PSCmdlet.ShouldProcess($e.hold, 'Delete verified hold')
+                Write-Host ("would clean up: {0} (backup at {1})" -f $e.hold, $backPath)
+                continue
+            }
             if ($e.state -eq 'Activated') {
                 Assert-Condition (-not (Test-Path -LiteralPath $backPath)) "Backup destination already exists: $backPath"
                 Copy-Tree $e.hold $backPath
