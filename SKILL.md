@@ -71,7 +71,7 @@ Do not proceed if either command fails, if files changed during copying, if inve
 & $scriptPath -DriveLetter $driveLetter -Phase Status
 ```
 
-`Status` compares the manifest with disk: it reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, junctions that do not fit the recorded state, and any recorded rollback snapshot that is missing, outside `migration\rollbacks`, lacks its hash, is unreadable, or no longer matches `destinationSnapshotHash`. Treat any reported issue as a blocker and reconcile it before continuing; a clean run prints `Status: manifest matches disk for the selected agents.`
+`Status` compares the manifest with disk: it reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, junctions that do not fit the recorded state, any recorded rollback snapshot that is missing, outside `migration\rollbacks`, lacks its hash, is unreadable, or no longer matches `destinationSnapshotHash`, and any orphaned `.incomplete-*` staging folder under `migration\rollbacks`. Treat any reported issue as a blocker and reconcile it before continuing; a clean run prints `Status: manifest matches disk for the selected agents.`
 
 After the user has closed affected agents and the agent has verified they are stopped, run:
 

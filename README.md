@@ -163,7 +163,7 @@ Check state:
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Status
 ```
 
-`Status` compares the manifest with disk. It reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, junctions that do not fit the recorded state, and any recorded rollback snapshot that is missing, outside `migration\rollbacks`, lacks its hash, is unreadable, or no longer matches `destinationSnapshotHash`. Reconcile any reported issue before the next phase; a clean run prints `Status: manifest matches disk for the selected agents.`
+`Status` compares the manifest with disk. It reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, junctions that do not fit the recorded state, any recorded rollback snapshot that is missing, outside `migration\rollbacks`, lacks its hash, is unreadable, or no longer matches `destinationSnapshotHash`, and any orphaned `.incomplete-*` staging folder under `migration\rollbacks`. Reconcile any reported issue before the next phase; a clean run prints `Status: manifest matches disk for the selected agents.`
 
 To exercise the migration phases without touching live agent data, run the scratch harness:
 
