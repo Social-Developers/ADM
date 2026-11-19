@@ -212,7 +212,53 @@ $entries = @(Selected $manifest)
 Assert-Condition ($entries.Count -gt 0) 'No matching agents in manifest.'
 
 switch ($Phase) {
-    'Status' { $entries | Format-Table id,state,source,destination,hold -AutoSize; break }
+    'Status' {
+        $report = @()
+        $issueCount = 0
+        foreach ($e in $entries) {
+            $problems = @()
+            $destination = if (Test-Path -LiteralPath $e.destination -PathType Container) { 'present' } else { 'missing' }
+            $hold = if (Test-Path -LiteralPath $e.hold -PathType Container) { 'present' } else { 'missing' }
+            $legacy = 'missing'
+            if (Test-Path -LiteralPath $e.source) {
+                $item = Get-Item -LiteralPath $e.source -Force
+                if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    $legacy = 'directory'
+                } elseif ($item.LinkType -ne 'Junction') {
+                    $legacy = 'other reparse point'
+                } else {
+                    $targets = @($item.Target)
+                    if ($targets.Count -gt 0 -and (FullPath $targets[0]) -ieq (FullPath $e.destination)) { $legacy = 'junction' }
+                    else { $legacy = 'redirected' }
+                }
+            }
+            if ($destination -eq 'missing' -and $e.state -ne 'Inventoried') { $problems += 'destination missing or unavailable' }
+            switch ($e.state) {
+                { $_ -in @('Activated', 'BackupVerified') } {
+                    if ($legacy -eq 'missing') { $problems += 'legacy junction missing' }
+                    elseif ($legacy -eq 'redirected') { $problems += 'legacy junction redirected' }
+                    elseif ($legacy -ne 'junction') { $problems += 'legacy path is not a junction' }
+                    if ($hold -eq 'missing') { $problems += 'hold missing' }
+                }
+                'Complete' {
+                    if ($legacy -ne 'junction') { $problems += 'legacy junction missing or redirected' }
+                    if ($hold -eq 'present') { $problems += 'hold still present' }
+                }
+                default {
+                    if ($legacy -eq 'junction' -or $legacy -eq 'redirected') { $problems += "legacy path is a junction while state is $($e.state)" }
+                }
+            }
+            if ($problems.Count -gt 0) { $issueCount += $problems.Count }
+            $report += [pscustomobject]@{
+                id = $e.id; state = $e.state; destination = $destination; hold = $hold; legacy = $legacy
+                issues = (@($problems) -join '; ')
+            }
+        }
+        $report | Format-Table id, state, destination, hold, legacy, issues -AutoSize
+        if ($issueCount -gt 0) { Write-Warning ("Status found {0} issue(s); reconcile them before the next phase." -f $issueCount) }
+        else { Write-Host 'Status: manifest matches disk for the selected agents.' }
+        break
+    }
     'Copy' {
         foreach ($e in $entries) {
             Assert-Condition ($e.state -eq 'Inventoried') "Cannot copy $($e.id) in state $($e.state)"
