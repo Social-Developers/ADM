@@ -222,6 +222,16 @@ try {
     $out = Invoke-Migrate @('-Phase', 'Status', '-DriveLetter', $rootLetter)
     Check-Text $out 'manifest matches disk' 'status agrees with a healthy state'
 
+    $orphanStaging = Join-Path $root 'migration\rollbacks\.incomplete-claude-orphan'
+    Add-File (Join-Path $orphanStaging 'partial.txt') 'partial'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Orphaned snapshot staging' 'status reports orphaned snapshot staging'
+    Check-Text $out '.incomplete-claude-orphan' 'status names the orphaned staging folder'
+    Check-Text $out 'Status found 1 issue(s)' 'status counts the orphaned staging folder'
+    Remove-Item -LiteralPath $orphanStaging -Recurse -Force
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status agrees again after clearing the staging folder'
+
     [IO.Directory]::Delete($claudeSource)
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'legacy junction missing' 'status reports a missing legacy junction'
