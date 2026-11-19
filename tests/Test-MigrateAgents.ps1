@@ -249,6 +249,42 @@ try {
     Check-Text $out 'manifest matches disk' 'status agrees again after the restores'
 
     Write-Host ''
+    Write-Host '=== snapshot space preflight ==='
+    # A genuinely full volume cannot be built without affecting the host, so parse
+    # and load the space helpers from the script under test and inject availability.
+    $spaceSource = Join-Path $runRoot 'space-source'
+    New-Item -ItemType Directory -Path (Join-Path $spaceSource 'nested') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $spaceSource 'small.bin'), ('a' * 1024))
+    [IO.File]::WriteAllText((Join-Path $spaceSource 'nested\large.bin'), ('b' * 2048))
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+    Check (@($parseErrors).Count -eq 0) 'migration script parses for helper extraction'
+    $helperNames = @('Assert-Condition', 'FullPath', 'Files-In', 'Get-SnapshotRequiredBytes', 'Assert-SnapshotSpace')
+    $helpers = @($ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $helperNames -contains $node.Name
+            }, $true))
+    Check ($helpers.Count -eq $helperNames.Count) 'snapshot space helpers are defined'
+    foreach ($helper in $helpers) { . ([scriptblock]::Create($helper.Extent.Text)) }
+    Check ((Get-SnapshotRequiredBytes $spaceSource) -eq ([long](1024 + 2048) + 1MB)) 'required space sums nested file sizes plus the reserve'
+    $emptySource = Join-Path $runRoot 'space-empty'
+    New-Item -ItemType Directory -Path $emptySource -Force | Out-Null
+    Check ((Get-SnapshotRequiredBytes $emptySource) -eq 1MB) 'empty snapshot needs only the reserve'
+    $required = Get-SnapshotRequiredBytes $spaceSource
+    $spaceError = $null
+    try { Assert-SnapshotSpace $spaceSource $root ($required - 1) } catch { $spaceError = $_.Exception.Message }
+    Check (-not [string]::IsNullOrWhiteSpace([string]$spaceError)) 'insufficient free space is refused'
+    Check-Text ([string]$spaceError) 'Insufficient free space for destination snapshot' 'refusal names the free-space condition'
+    Check-Text ([string]$spaceError) ("need {0} bytes, have {1}." -f $required, ($required - 1)) 'refusal reports required and available bytes'
+    $spaceAccepted = $true
+    try { Assert-SnapshotSpace $spaceSource $root $required } catch { $spaceAccepted = $false }
+    Check $spaceAccepted 'exactly the required space is accepted'
+    $measured = $true
+    try { Assert-SnapshotSpace $spaceSource $root } catch { $measured = $false }
+    Check $measured 'real free-space measurement accepts the scratch volume'
+
+    Write-Host ''
     Write-Host '=== rollback ==='
     $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'claude', '-DriveLetter', $rootLetter, '-WhatIf')
     Check-Text $out 'What if:' 'rollback previews without approval switches'
@@ -274,8 +310,35 @@ try {
     Check-Text $out 'added=1 removed=0 changed=1' 'counts the added and changed files'
     Check ((Read-Entry 'claude').state -eq 'Activated') 'refused rollback keeps claude Activated'
 
+    # A failed snapshot copy must leave no staging or final folder and no manifest entry.
+    # Put a fake robocopy.exe on PATH so only the snapshot copy fails.
+    $rollbacksRoot = Join-Path $root 'migration\rollbacks'
+    $stale = Join-Path $rollbacksRoot '.incomplete-claude-stale'
+    Add-File (Join-Path $stale 'partial.txt') 'partial'
+    $fakeTools = Join-Path $runRoot 'fake-tools'
+    New-Item -ItemType Directory -Path $fakeTools -Force | Out-Null
+    Add-Type -TypeDefinition 'public static class FakeRobocopy { public static int Main(string[] args) { return 8; } }' -OutputAssembly (Join-Path $fakeTools 'robocopy.exe') -OutputType ConsoleApplication
+    $savedPath = $env:PATH
+    $env:PATH = $fakeTools + ';' + $savedPath
+    try {
+        $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-AcceptDestinationChanges', '-DriveLetter', $rootLetter) -ExpectFailure
+    } finally { $env:PATH = $savedPath }
+    Check-Text $out 'Snapshot copy failed' 'failed snapshot copy aborts the rollback'
+    Check (-not (Test-Path -LiteralPath $stale)) 'stale incomplete snapshot is cleared before copying'
+    $partials = @(Get-ChildItem -LiteralPath $rollbacksRoot -Directory -Force -Filter '.incomplete-*')
+    Check ($partials.Count -eq 0) 'failed snapshot copy leaves no staging folder'
+    $finals = @(Get-ChildItem -LiteralPath $rollbacksRoot -Directory -Force | Where-Object { $_.Name -notlike '.incomplete-*' })
+    Check ($finals.Count -eq 0) 'failed snapshot copy leaves no final folder'
+    Check ((Read-Entry 'claude').state -eq 'Activated') 'failed snapshot copy leaves claude Activated'
+    Check ($null -eq (Read-Entry 'claude').PSObject.Properties['destinationSnapshot']) 'failed snapshot copy records no snapshot'
+    Check (Test-Path -LiteralPath $claudeHold) 'failed snapshot copy keeps the hold'
+
     $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-AcceptDestinationChanges', '-DriveLetter', $rootLetter)
     Check (-not (Test-Path -LiteralPath $claudeHold)) 'accepted rollback restores the hold'
+    $finals = @(Get-ChildItem -LiteralPath $rollbacksRoot -Directory -Force | Where-Object { $_.Name -notlike '.incomplete-*' })
+    Check ($finals.Count -eq 1) 'retry after a failed copy creates exactly one snapshot'
+    $partials = @(Get-ChildItem -LiteralPath $rollbacksRoot -Directory -Force -Filter '.incomplete-*')
+    Check ($partials.Count -eq 0) 'successful snapshot leaves no staging folder'
     Check (Test-Path -LiteralPath (Join-Path $claudeDest 'added.txt')) 'accepted rollback preserves the changed destination'
     $rolledBack = Read-Entry 'claude'
     Check ($rolledBack.rolledBackWithChanges -eq $true) 'rollback records the changed destination'
