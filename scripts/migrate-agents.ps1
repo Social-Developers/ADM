@@ -420,10 +420,20 @@ switch ($Phase) {
                 continue
             }
             if ($e.state -eq 'Activated') {
-                Assert-Condition (-not (Test-Path -LiteralPath $backPath)) "Backup destination already exists: $backPath"
-                Copy-Tree $e.hold $backPath
-                Update-State $manifest $e 'BackupVerified'
-            } else { Assert-EqualTrees $e.hold $backPath }
+                if (Test-Path -LiteralPath $backPath -PathType Container) {
+                    # A rollback after an interrupted cleanup leaves the backup behind.
+                    try { Assert-EqualTrees $e.hold $backPath }
+                    catch { throw "Existing backup differs from the hold; refusing cleanup: $backPath. $($_.Exception.Message)" }
+                    Update-State $manifest $e 'BackupVerified'
+                    Write-Host "Resuming cleanup with existing backup: $backPath"
+                } else {
+                    Copy-Tree $e.hold $backPath
+                    Update-State $manifest $e 'BackupVerified'
+                }
+            } else {
+                Assert-Condition (Test-Path -LiteralPath $backPath -PathType Container) "Backup missing for BackupVerified entry: $backPath"
+                Assert-EqualTrees $e.hold $backPath
+            }
             # Revalidate immediately before destructive operation.
             Assert-EqualTrees $e.hold $e.destination
             Assert-EqualTrees $e.hold $backPath
