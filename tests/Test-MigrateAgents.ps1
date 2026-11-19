@@ -125,9 +125,13 @@ try {
     $cursorSource = Join-Path $fakeHome '.cursor'
     $cursorHold = $cursorSource + '.qagents-migration-hold'
     $cursorDest = Join-Path $root 'agents\cursor'
+    $geminiSource = Join-Path $fakeHome '.gemini'
+    $geminiHold = $geminiSource + '.qagents-migration-hold'
+    $geminiDest = Join-Path $root 'agents\gemini'
     $claudeSettings = Join-Path $claudeDest 'settings.json'
     $claudeBackup = Join-Path $backupRoot 'agents-claude'
     $cursorBackup = Join-Path $backupRoot 'agents-cursor'
+    $geminiBackup = Join-Path $backupRoot 'agents-gemini'
 
     Write-Host ''
     Write-Host '=== inventory ==='
@@ -349,11 +353,40 @@ try {
 
     Write-Host ''
     Write-Host '=== cleanup and interrupted recovery ==='
+    # Interrupt cursor's cleanup after the backup is copied, roll back, and activate
+    # again: the next cleanup must resume from the existing verified backup.
+    $holdHandles = @()
+    try {
+        foreach ($f in @(Get-ChildItem -LiteralPath $cursorHold -Recurse -File)) {
+            $holdHandles += [IO.File]::Open($f.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        }
+        $out = Invoke-Migrate @('-Phase', 'Cleanup', '-Agent', 'cursor', '-DriveLetter', $rootLetter, '-ConfirmAgentsValidated', '-ApproveDeletion', '-BackupRoot', $backupRoot) -ExpectFailure
+        Check (Test-Path -LiteralPath $cursorHold) 'failed cleanup keeps the cursor hold'
+        Check (Test-Path -LiteralPath $cursorBackup) 'failed cleanup keeps the cursor backup'
+        Check ((Read-Entry 'cursor').state -eq 'BackupVerified') 'failed cleanup records cursor BackupVerified'
+    }
+    finally {
+        foreach ($handle in $holdHandles) { $handle.Dispose() }
+    }
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-ApproveRollback', '-DriveLetter', $rootLetter)
+    Check (-not (Test-Path -LiteralPath $cursorHold)) 'rollback after cleanup restores the cursor hold'
+    Check (Test-Path -LiteralPath $cursorBackup) 'rollback leaves the cleanup backup in place'
+    Check ((Read-Entry 'cursor').state -eq 'Verified') 'rollback after cleanup returns cursor to Verified'
+    $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
+    Check ((Read-Entry 'cursor').state -eq 'Activated') 'cursor can be activated after the cleanup rollback'
+
+    Add-Content -LiteralPath (Join-Path $cursorBackup 'notes.txt') -Value 'extra'
+    $out = Invoke-Migrate @('-Phase', 'Cleanup', '-Agent', 'cursor', '-DriveLetter', $rootLetter, '-ConfirmAgentsValidated', '-ApproveDeletion', '-BackupRoot', $backupRoot) -ExpectFailure
+    Check-Text $out 'Existing backup differs' 'cleanup refuses a mismatched existing backup'
+    Check ((Read-Entry 'cursor').state -eq 'Activated') 'mismatched backup refusal leaves cursor Activated'
+    Set-Content -LiteralPath (Join-Path $cursorBackup 'notes.txt') -Value 'cursor notes'
+
     $out = Invoke-Migrate @('-Phase', 'Cleanup', '-Agent', 'cursor', '-DriveLetter', $rootLetter, '-ConfirmAgentsValidated', '-ApproveDeletion', '-BackupRoot', $backupRoot)
-    Check (-not (Test-Path -LiteralPath $cursorHold)) 'cleanup removes the verified hold'
-    Check (Test-Path -LiteralPath $cursorBackup) 'cleanup keeps the independent backup'
-    Check ((Read-Entry 'cursor').state -eq 'Complete') 'cleanup records cursor as Complete'
-    Check (Test-Path -LiteralPath (Join-Path $cursorSource 'notes.txt')) 'cleanup leaves the junction readable'
+    Check-Text $out 'Resuming cleanup with existing backup' 'cleanup resumes from the existing backup'
+    Check (-not (Test-Path -LiteralPath $cursorHold)) 'resumed cleanup removes the cursor hold'
+    Check (Test-Path -LiteralPath $cursorBackup) 'resumed cleanup keeps the cursor backup'
+    Check ((Read-Entry 'cursor').state -eq 'Complete') 'resumed cleanup records cursor as Complete'
+    Check (Test-Path -LiteralPath (Join-Path $cursorSource 'notes.txt')) 'resumed cleanup leaves the junction readable'
 
     # Genuine interruption: every hold file is open without delete sharing, so the backup
     # is copied and verified and the state is saved, but Remove-Item cannot delete the hold.
@@ -375,11 +408,21 @@ try {
     Check (Test-Path -LiteralPath $claudeBackup) 'resumed cleanup reuses the verified backup'
     Check ((Read-Entry 'claude').state -eq 'Complete') 'resumed cleanup records claude as Complete'
 
+    # Normal cleanup still copies a fresh backup when none exists.
+    $out = Invoke-Migrate @('-Phase', 'Copy', '-Agent', 'gemini', '-DriveLetter', $rootLetter)
+    $out = Invoke-Migrate @('-Phase', 'Verify', '-Agent', 'gemini', '-DriveLetter', $rootLetter)
+    $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'gemini', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
+    Check ((Read-Entry 'gemini').state -eq 'Activated') 'gemini can be activated for normal cleanup'
+    $out = Invoke-Migrate @('-Phase', 'Cleanup', '-Agent', 'gemini', '-DriveLetter', $rootLetter, '-ConfirmAgentsValidated', '-ApproveDeletion', '-BackupRoot', $backupRoot)
+    Check (-not (Test-Path -LiteralPath $geminiHold)) 'normal cleanup removes the gemini hold'
+    Check (Test-Path -LiteralPath $geminiBackup) 'normal cleanup keeps the gemini backup'
+    Check ((Read-Entry 'gemini').state -eq 'Complete') 'normal cleanup records gemini as Complete'
+
     Write-Host ''
     Write-Host '=== final state ==='
     Check (Test-Path -LiteralPath (Join-Path $claudeSource 'settings.json')) 'claude destination survives cleanup'
     Check (Test-Path -LiteralPath (Join-Path $cursorSource 'notes.txt')) 'cursor destination survives cleanup'
-    Check ((Read-Entry 'gemini').state -eq 'Inventoried') 'untouched agent keeps its state'
+    Check (Test-Path -LiteralPath (Join-Path $geminiSource 'config.json')) 'gemini destination survives cleanup'
     Check ((Read-Manifest).schema -eq 1) 'manifest schema is unchanged'
     $out = Invoke-Migrate @('-Phase', 'Status', '-DriveLetter', $rootLetter)
     Check-Text $out 'manifest matches disk' 'status agrees after cleanup'
