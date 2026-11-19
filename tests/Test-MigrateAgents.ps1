@@ -212,6 +212,55 @@ try {
     Check ($out.Contains('Verified: claude')) 'verify accepts the hold after activation'
 
     Write-Host ''
+    Write-Host '=== rollback ==='
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'ConfirmAgentsStopped' 'rollback requires the stopped-agent switch'
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'ApproveRollback' 'rollback requires explicit approval'
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'gemini', '-ConfirmAgentsStopped', '-ApproveRollback', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Cannot roll back gemini in state Inventoried' 'rollback refuses an agent that was never activated'
+    Check ((Read-Entry 'cursor').state -eq 'Activated') 'refused rollback leaves the state alone'
+
+    # A destination that changed since activation must not be stranded by a rollback.
+    Set-Content -LiteralPath $claudeSettings -Value '{"theme":"lite"}'
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Destination changed since activation' 'rollback refuses a changed destination'
+    Set-Content -LiteralPath $claudeSettings -Value '{"theme":"dark"}'
+
+    # Only a junction known to point at this destination may be removed.
+    [IO.Directory]::Delete($claudeSource)
+    $decoy = Join-Path $root 'agents\decoy'
+    New-Item -ItemType Directory -Path $decoy -Force | Out-Null
+    New-Item -ItemType Junction -Path $claudeSource -Target $decoy | Out-Null
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Legacy junction points elsewhere' 'rollback refuses a redirected junction'
+    Check ((Get-Item -LiteralPath $claudeSource -Force).LinkType -eq 'Junction') 'redirected junction is left in place'
+    [IO.Directory]::Delete($claudeSource)
+    New-Item -ItemType Junction -Path $claudeSource -Target $claudeDest | Out-Null
+    Check ((Read-Entry 'claude').state -eq 'Activated') 'failed rollback leaves claude Activated'
+
+    # Successful rollback: restore the hold, remove only the junction, keep the destination.
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-ApproveRollback', '-DriveLetter', $rootLetter)
+    Check (-not (Test-Path -LiteralPath $cursorHold)) 'rollback renames the hold back'
+    $restored = Get-Item -LiteralPath $cursorSource -Force
+    Check ((($restored.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) 'rollback restores a real directory'
+    Check (Test-Path -LiteralPath (Join-Path $cursorSource 'notes.txt')) 'restored source has its data'
+    Check (Test-Path -LiteralPath (Join-Path $cursorDest 'notes.txt')) 'rollback leaves the destination in place'
+    Check ((Read-Entry 'cursor').state -eq 'Verified') 'rollback returns the entry to Verified'
+    Check (-not [string]::IsNullOrWhiteSpace((Read-Entry 'cursor').rolledBackUtc)) 'rollback records when it happened'
+
+    # Half-rollback: junction already gone, hold still present, state still Activated.
+    $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
+    Check ((Read-Entry 'cursor').state -eq 'Activated') 'rolled-back agent can be activated again'
+    [IO.Directory]::Delete($cursorSource)
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-ApproveRollback', '-DriveLetter', $rootLetter)
+    $restored = Get-Item -LiteralPath $cursorSource -Force
+    Check ((($restored.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) 'half-rollback resumes and restores the hold'
+    Check ((Read-Entry 'cursor').state -eq 'Verified') 'resumed rollback records Verified'
+    $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
+    Check ((Read-Entry 'cursor').state -eq 'Activated') 'restored agent can be activated after the resume'
+
+    Write-Host ''
     Write-Host '=== cleanup refusals ==='
     New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $root 'backup') -Force | Out-Null
