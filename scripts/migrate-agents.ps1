@@ -28,7 +28,8 @@ param(
     [switch]$ConfirmAgentsStopped,
     [switch]$ConfirmAgentsValidated,
     [switch]$ApproveDeletion,
-    [switch]$ApproveRollback
+    [switch]$ApproveRollback,
+    [switch]$AcceptDestinationChanges
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -96,6 +97,22 @@ function Assert-EqualTrees([string]$A, [string]$B) {
     $ad = @(Get-ChildItem -LiteralPath $A -Force -Recurse -Directory | ForEach-Object { (Relative $A $_.FullName).ToLowerInvariant() } | Sort-Object)
     $bd = @(Get-ChildItem -LiteralPath $B -Force -Recurse -Directory | ForEach-Object { (Relative $B $_.FullName).ToLowerInvariant() } | Sort-Object)
     Assert-Condition ((@($ad) -join "`n") -ceq (@($bd) -join "`n")) "Directory layout mismatch: $A vs $B"
+}
+function Get-TreeDiff([string]$Reference, [string]$Current) {
+    $referenceFiles = @{}
+    foreach ($f in @(Files-In $Reference)) { $referenceFiles[(Relative $Reference $f.FullName).ToLowerInvariant()] = $f }
+    $currentFiles = @{}
+    foreach ($f in @(Files-In $Current)) { $currentFiles[(Relative $Current $f.FullName).ToLowerInvariant()] = $f }
+    $added = @(); $removed = @(); $changed = @()
+    foreach ($key in $currentFiles.Keys) {
+        if (-not $referenceFiles.ContainsKey($key)) { $added += $key; continue }
+        $a = $referenceFiles[$key]; $b = $currentFiles[$key]
+        if ($a.Length -ne $b.Length -or (FileHash $a.FullName) -ne (FileHash $b.FullName)) { $changed += $key }
+    }
+    foreach ($key in $referenceFiles.Keys) { if (-not $currentFiles.ContainsKey($key)) { $removed += $key } }
+    return [pscustomobject]@{
+        added = @($added | Sort-Object); removed = @($removed | Sort-Object); changed = @($changed | Sort-Object)
+    }
 }
 function Copy-Tree([string]$Source, [string]$Destination) {
     Assert-TreeSafe $Source
@@ -317,8 +334,19 @@ switch ($Phase) {
             Assert-Condition (Test-Path -LiteralPath $e.destination -PathType Container) "Destination missing: $($e.destination)"
             Assert-TreeSafe $e.hold
             Assert-TreeSafe $e.destination
-            try { Assert-EqualTrees $e.hold $e.destination }
-            catch { throw "Destination changed since activation; refusing rollback of $($e.id). $($_.Exception.Message)" }
+            $diff = Get-TreeDiff $e.hold $e.destination
+            $diffCount = $diff.added.Count + $diff.removed.Count + $diff.changed.Count
+            if ($diffCount -gt 0) {
+                Write-Host ("destination differs: added={0} removed={1} changed={2}" -f $diff.added.Count, $diff.removed.Count, $diff.changed.Count)
+                foreach ($kind in @('added', 'removed', 'changed')) {
+                    $items = @($diff.$kind)
+                    if ($items.Count -gt 0) { Write-Host ("  {0,-8}: {1}" -f $kind, (($items | Select-Object -First 10) -join ', ')) }
+                }
+                if (-not $AcceptDestinationChanges) {
+                    throw "Destination changed since activation; refusing rollback of $($e.id) without -AcceptDestinationChanges."
+                }
+                Write-Warning "Destination changed since activation; keeping the changed destination at $($e.destination)."
+            }
             if (Test-Path -LiteralPath $e.source) {
                 $link = Get-Item -LiteralPath $e.source -Force
                 Assert-Condition (($link.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) 'Legacy path is not a junction; refusing rollback.'
@@ -332,6 +360,10 @@ switch ($Phase) {
             Assert-Condition (Test-Path -LiteralPath $e.source -PathType Container) 'Restored source is missing.'
             Assert-NoReparse $e.source
             $e | Add-Member -NotePropertyName rolledBackUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+            $e | Add-Member -NotePropertyName rolledBackWithChanges -NotePropertyValue ($diffCount -gt 0) -Force
+            $e | Add-Member -NotePropertyName destinationChanges -NotePropertyValue ([pscustomobject]@{
+                    added = $diff.added.Count; removed = $diff.removed.Count; changed = $diff.changed.Count
+                }) -Force
             Update-State $manifest $e 'Verified'
             Write-Host "Rolled back $($e.id): $($e.source) (destination left at $($e.destination))"
         }
