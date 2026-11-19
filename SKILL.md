@@ -71,6 +71,8 @@ Do not proceed if either command fails, if files changed during copying, if inve
 & $scriptPath -DriveLetter $driveLetter -Phase Status
 ```
 
+`Status` compares the manifest with disk: it reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, and junctions that do not fit the recorded state. Treat any reported issue as a blocker and reconcile it before continuing; a clean run prints `Status: manifest matches disk for the selected agents.`
+
 After the user has closed affected agents and the agent has verified they are stopped, run:
 
 ```powershell
@@ -78,6 +80,14 @@ After the user has closed affected agents and the agent has verified they are st
 ```
 
 The script renames each original source directory to a sibling hold directory and creates a legacy junction to the verified the selected drive destination. It must never be invoked on live directories with active writes. If activation fails, stop and diagnose. Do not delete the hold directory manually.
+
+If an agent fails after activation, use Rollback rather than editing junctions or holds by hand:
+
+```powershell
+& $scriptPath -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback
+```
+
+Both switches are required. Rollback verifies the hold, destination and legacy junction, refuses when the destination changed since activation, removes only the junction that points at the recorded destination, and renames the hold back. The destination is left in place and the entry returns to `Verified`, so it can be activated again. It cannot recover an agent whose Cleanup already completed, because the hold no longer exists.
 
 ## Operational verification before cleanup
 

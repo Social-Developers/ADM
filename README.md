@@ -132,6 +132,14 @@ For each selected agent, the original directory is renamed to a sibling hold dir
 
 **The switch asserts that you checked the agents are stopped; it does not stop processes automatically.**
 
+If an agent fails after activation, use the Rollback phase instead of hand-editing junctions:
+
+```powershell
+.\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback
+```
+
+Rollback requires both switches. It verifies the hold, destination and legacy junction, refuses when the destination changed since activation, and removes only a junction that points at the recorded destination. It renames the hold back, records the time, returns the entry to `Verified`, and leaves the copied destination in place. It cannot recover an agent whose Cleanup already completed, because the hold is gone by then.
+
 ### 5. Test each agent
 
 Launch each affected agent and confirm that its settings, private skills, memories, and plugins work. Make a disposable write through its usual data path and confirm the data reaches the selected drive. Remove the test file and reconcile any newly written files against the held original. A strict comparison may fail if the destination changed after activation; do not overwrite new user data to make it pass.
@@ -141,6 +149,8 @@ Check state:
 ```powershell
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Status
 ```
+
+`Status` compares the manifest with disk. It reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, and junctions that do not fit the recorded state. Reconcile any reported issue before the next phase; a clean run prints `Status: manifest matches disk for the selected agents.`
 
 To exercise the migration phases without touching live agent data, run the scratch harness:
 
