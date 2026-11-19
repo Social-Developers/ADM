@@ -61,7 +61,7 @@ function Save-Json([object]$Object, [string]$Path) {
     $json = ConvertTo-Json -InputObject $Object -Depth 15
     [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
     if (Test-Path -LiteralPath $Path) {
-        [IO.File]::Replace($tmp, $Path, $null)
+        [IO.File]::Replace($tmp, $Path, [NullString]::Value)
     } else { [IO.File]::Move($tmp, $Path) }
 }
 function Load-Json([string]$Path) {
