@@ -16,7 +16,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Inventory','Copy','Verify','Activate','Cleanup','Status')]
+    [ValidateSet('Inventory','Copy','Verify','Activate','Rollback','Cleanup','Status')]
     [string]$Phase = 'Inventory',
     [string]$Root,
     [ValidatePattern('^[A-Za-z]:?$')]
@@ -26,7 +26,8 @@ param(
     [string]$BackupRoot,
     [switch]$ConfirmAgentsStopped,
     [switch]$ConfirmAgentsValidated,
-    [switch]$ApproveDeletion
+    [switch]$ApproveDeletion,
+    [switch]$ApproveRollback
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -257,6 +258,35 @@ switch ($Phase) {
                 if (-not (Test-Path -LiteralPath $e.source)) { Rename-Item -LiteralPath $e.hold -NewName ([IO.Path]::GetFileName($e.source)) }
                 throw
             }
+        }
+        break
+    }
+    'Rollback' {
+        Assert-Condition $ConfirmAgentsStopped 'Close affected agents and pass -ConfirmAgentsStopped.'
+        Assert-Condition $ApproveRollback 'Explicit -ApproveRollback is required.'
+        foreach ($e in $entries) {
+            Assert-Condition ($e.state -in @('Activated','BackupVerified')) "Cannot roll back $($e.id) in state $($e.state)"
+            Assert-Condition (Test-Path -LiteralPath $e.hold -PathType Container) "Hold missing: $($e.hold)"
+            Assert-Condition (Test-Path -LiteralPath $e.destination -PathType Container) "Destination missing: $($e.destination)"
+            Assert-TreeSafe $e.hold
+            Assert-TreeSafe $e.destination
+            try { Assert-EqualTrees $e.hold $e.destination }
+            catch { throw "Destination changed since activation; refusing rollback of $($e.id). $($_.Exception.Message)" }
+            if (Test-Path -LiteralPath $e.source) {
+                $link = Get-Item -LiteralPath $e.source -Force
+                Assert-Condition (($link.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) 'Legacy path is not a junction; refusing rollback.'
+                Assert-Condition ($link.LinkType -eq 'Junction') 'Legacy path is not a junction; refusing rollback.'
+                $targets = @($link.Target)
+                Assert-Condition ($targets.Count -gt 0 -and (FullPath $targets[0]) -ieq (FullPath $e.destination)) 'Legacy junction points elsewhere; refusing rollback.'
+                [IO.Directory]::Delete($e.source)
+                Assert-Condition (-not (Test-Path -LiteralPath $e.source)) 'Junction removal incomplete.'
+            }
+            Rename-Item -LiteralPath $e.hold -NewName ([IO.Path]::GetFileName($e.source)) -ErrorAction Stop
+            Assert-Condition (Test-Path -LiteralPath $e.source -PathType Container) 'Restored source is missing.'
+            Assert-NoReparse $e.source
+            $e | Add-Member -NotePropertyName rolledBackUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+            Update-State $manifest $e 'Verified'
+            Write-Host "Rolled back $($e.id): $($e.source) (destination left at $($e.destination))"
         }
         break
     }
