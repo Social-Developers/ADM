@@ -175,6 +175,14 @@ try {
     Check-Text $out 'Cannot verify state Inventoried' 'verify refuses an uncopied agent'
 
     Write-Host ''
+    Write-Host '=== activate preview ==='
+    $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-DriveLetter', $rootLetter, '-WhatIf')
+    Check-Text $out 'What if:' 'activate previews without the stopped-agent switch'
+    Check (Test-Path -LiteralPath $claudeSource -PathType Container) 'activate preview keeps the source directory'
+    Check (-not (Test-Path -LiteralPath $claudeHold)) 'activate preview creates no hold'
+    Check ((Read-Entry 'claude').state -eq 'Verified') 'activate preview leaves the state Verified'
+
+    Write-Host ''
     Write-Host '=== activate ==='
     $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-DriveLetter', $rootLetter) -ExpectFailure
     Check-Text $out 'ConfirmAgentsStopped' 'activate requires the stopped-agent switch'
@@ -238,6 +246,12 @@ try {
 
     Write-Host ''
     Write-Host '=== rollback ==='
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'claude', '-DriveLetter', $rootLetter, '-WhatIf')
+    Check-Text $out 'What if:' 'rollback previews without approval switches'
+    Check (Test-Path -LiteralPath $claudeSource) 'rollback preview leaves the junction'
+    Check (Test-Path -LiteralPath $claudeHold) 'rollback preview leaves the hold'
+    Check ((Read-Entry 'claude').state -eq 'Activated') 'rollback preview leaves the state alone'
+
     $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-DriveLetter', $rootLetter) -ExpectFailure
     Check-Text $out 'ConfirmAgentsStopped' 'rollback requires the stopped-agent switch'
     $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter) -ExpectFailure
@@ -309,6 +323,12 @@ try {
     $sameVolumeBackup = Join-Path $root 'backup'
     $sourceVolumeBackup = Join-Path $runRoot 'cbackup'
     New-Item -ItemType Directory -Path $sourceVolumeBackup -Force | Out-Null
+
+    $out = Invoke-Migrate @('-Phase', 'Cleanup', '-Agent', 'claude', '-DriveLetter', $rootLetter, '-WhatIf')
+    Check-Text $out 'What if:' 'cleanup previews without switches or a backup'
+    Check (Test-Path -LiteralPath $claudeHold) 'cleanup preview keeps the hold'
+    Check (-not (Test-Path -LiteralPath $claudeBackup)) 'cleanup preview creates no backup'
+    Check ((Read-Entry 'claude').state -eq 'Activated') 'cleanup preview leaves the state alone'
 
     $cleanup = @('-Phase', 'Cleanup', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     $out = Invoke-Migrate ($cleanup) -ExpectFailure
