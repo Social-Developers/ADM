@@ -287,6 +287,23 @@ try {
     $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
     Check ((Read-Entry 'claude').state -eq 'Activated') 'reconciled agent can be activated again'
 
+    # A destination missing a file must be reported as removed and still preserved.
+    Remove-Item -LiteralPath $claudeSettings -Force
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'removed=1' 'rollback reports a file missing from the destination'
+    Check-Text $out 'settings.json' 'rollback names the removed file'
+    Check ((Read-Entry 'claude').state -eq 'Activated') 'missing-file refusal keeps claude Activated'
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-AcceptDestinationChanges', '-DriveLetter', $rootLetter)
+    Check (-not (Test-Path -LiteralPath $claudeSettings)) 'accepted rollback preserves the missing destination file'
+    Check (Test-Path -LiteralPath (Join-Path $claudeDest 'skills\demo\SKILL.md')) 'accepted rollback keeps the rest of the destination'
+    Check (Test-Path -LiteralPath (Join-Path $claudeSource 'settings.json')) 'accepted rollback restores the missing source file'
+    $removedEntry = Read-Entry 'claude'
+    Check ($removedEntry.destinationChanges.removed -eq 1) 'rollback records the removed file count'
+    Check ($removedEntry.state -eq 'Verified') 'removed-file rollback returns the entry to Verified'
+    Set-Content -LiteralPath $claudeSettings -Value '{"theme":"dark"}'
+    $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
+    Check ((Read-Entry 'claude').state -eq 'Activated') 'claude can be activated after the removed-file rollback'
+
     # Only a junction known to point at this destination may be removed.
     [IO.Directory]::Delete($claudeSource)
     $decoy = Join-Path $root 'agents\decoy'
