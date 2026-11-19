@@ -149,7 +149,7 @@ Rollback requires `-ConfirmAgentsStopped` and `-ApproveRollback`. It verifies th
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback -AcceptDestinationChanges
 ```
 
-When the switch is used and the diff is non-empty, Rollback first copies the changed destination to `<DRIVE>:\agents\migration\rollbacks\<agent>-<UTC timestamp>`, verifies the copy, and records its path as `destinationSnapshot` in the manifest. Each approved rollback gets its own folder. Snapshots are retained deliberately: the script never prunes them, and Cleanup does not remove them. Keep each snapshot until its contents have been reconciled or are no longer needed. `-WhatIf` never creates one.
+When the switch is used and the diff is non-empty, Rollback first copies the changed destination to `<DRIVE>:\agents\migration\rollbacks\<agent>-<UTC timestamp>`, verifies the copy, and records its path as `destinationSnapshot` plus a SHA-256 tree digest as `destinationSnapshotHash` in the manifest. Each approved rollback gets its own folder. Snapshots are retained deliberately: the script never prunes them, and Cleanup does not remove them. Keep each snapshot until its contents have been reconciled or are no longer needed. `-WhatIf` never creates one.
 
 Rollback renames the hold back, records the time, returns the entry to `Verified`, and leaves the destination in place either way. It cannot recover an agent whose Cleanup already completed, because the hold is gone by then.
 
@@ -163,7 +163,7 @@ Check state:
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Status
 ```
 
-`Status` compares the manifest with disk. It reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, and junctions that do not fit the recorded state. Reconcile any reported issue before the next phase; a clean run prints `Status: manifest matches disk for the selected agents.`
+`Status` compares the manifest with disk. It reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, junctions that do not fit the recorded state, and any recorded rollback snapshot that is missing, outside `migration\rollbacks`, lacks its hash, is unreadable, or no longer matches `destinationSnapshotHash`. Reconcile any reported issue before the next phase; a clean run prints `Status: manifest matches disk for the selected agents.`
 
 To exercise the migration phases without touching live agent data, run the scratch harness:
 

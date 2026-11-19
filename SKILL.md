@@ -71,7 +71,7 @@ Do not proceed if either command fails, if files changed during copying, if inve
 & $scriptPath -DriveLetter $driveLetter -Phase Status
 ```
 
-`Status` compares the manifest with disk: it reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, and junctions that do not fit the recorded state. Treat any reported issue as a blocker and reconcile it before continuing; a clean run prints `Status: manifest matches disk for the selected agents.`
+`Status` compares the manifest with disk: it reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, junctions that do not fit the recorded state, and any recorded rollback snapshot that is missing, outside `migration\rollbacks`, lacks its hash, is unreadable, or no longer matches `destinationSnapshotHash`. Treat any reported issue as a blocker and reconcile it before continuing; a clean run prints `Status: manifest matches disk for the selected agents.`
 
 After the user has closed affected agents and the agent has verified they are stopped, run:
 
@@ -95,7 +95,7 @@ Both switches are required. Rollback verifies the hold, destination and legacy j
 & $scriptPath -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback -AcceptDestinationChanges
 ```
 
-The changed destination is kept in place and copied to `<DRIVE>:\agents\migration\rollbacks\<agent>-<UTC timestamp>`; the copy is verified, and the manifest records `destinationSnapshot`, `rolledBackWithChanges`, the counts under `destinationChanges` and `rolledBackUtc`. Each approved rollback with a non-empty diff gets its own folder. Snapshots are never pruned automatically and Cleanup does not remove them: keep them until the preserved data has been reconciled or is no longer needed, and tell the user where they are. `-WhatIf` creates no snapshot. Rollback then renames the hold back, and the entry returns to `Verified`, so it can be activated again. Never add `-AcceptDestinationChanges` without showing the diff summary first. It cannot recover an agent whose Cleanup already completed, because the hold no longer exists.
+The changed destination is kept in place and copied to `<DRIVE>:\agents\migration\rollbacks\<agent>-<UTC timestamp>`; the copy is verified, and the manifest records `destinationSnapshot`, a SHA-256 tree digest as `destinationSnapshotHash`, `rolledBackWithChanges`, the counts under `destinationChanges` and `rolledBackUtc`. Each approved rollback with a non-empty diff gets its own folder. Snapshots are never pruned automatically and Cleanup does not remove them: keep them until the preserved data has been reconciled or is no longer needed, and tell the user where they are. `-WhatIf` creates no snapshot. Rollback then renames the hold back, and the entry returns to `Verified`, so it can be activated again. Never add `-AcceptDestinationChanges` without showing the diff summary first. It cannot recover an agent whose Cleanup already completed, because the hold no longer exists.
 
 ### Previewing moves and deletions
 
