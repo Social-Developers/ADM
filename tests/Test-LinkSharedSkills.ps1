@@ -20,30 +20,41 @@
                           trailing dot only survives through a \\?\ path, so the junction
                           target cannot resolve: one link is created, the next fails
 
-  Nothing outside the scratch root and the temp profile is touched; the deny rule is
-  removed and both trees deleted at the end. Exit code 0 means every check passed.
-.PARAMETER DriveLetter
-  Scratch volume for the throwaway root, e.g. Q.
+  Isolation: every run creates a unique %TEMP% folder with a random name and a
+  sentinel file, maps a free drive letter to a folder inside it with subst, and
+  deletes only that folder after the sentinel matches. No existing drive root,
+  Q:\_admtest path or real agent data is touched. Exit code 0 means every check
+  passed.
 .EXAMPLE
   powershell -NoProfile -File tests\Test-LinkSharedSkills.ps1
 #>
-param(
-    [ValidatePattern('^[A-Za-z]:?$')]
-    [string]$DriveLetter = 'Q'
-)
+param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Link-SharedSkills.ps1'
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) { throw "Link-SharedSkills.ps1 not found at $scriptPath." }
 
-$root = '{0}:\_admtest\agents' -f $DriveLetter.TrimEnd(':').ToUpperInvariant()
-$profileDir = Join-Path $env:TEMP 'adm-link-harness-profile'
-$claudeHome = Join-Path $root 'agents\claude'
-$cursorHome = Join-Path $root 'agents\cursor'
-$claudeSkills = Join-Path $claudeHome 'skills'
-$linksPath = Join-Path $root 'registry\skill-links.json'
-$dotSkill = Join-Path $root 'shared\skills\zz-dot.'
+$runId = [guid]::NewGuid().ToString('N')
+$tempBase = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
+$runRoot = Join-Path $tempBase ('adm-link-harness-' + $runId)
+if (Test-Path -LiteralPath $runRoot) { throw "Refusing to reuse existing scratch root: $runRoot" }
+New-Item -ItemType Directory -Path $runRoot | Out-Null
+$sentinelPath = Join-Path $runRoot '.adm-link-harness'
+Set-Content -LiteralPath $sentinelPath -Value $runId
+
+$script:scratchLetters = @()
+$rootLetter = ''
+$root = ''
+$volumeDir = ''
+$profileDir = ''
+$claudeHome = ''
+$cursorHome = ''
+$claudeSkills = ''
+$linksPath = ''
+$dotSkill = ''
+$dotSkillPhysical = ''
+$denyActive = $false
 $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 
 $script:checks = 0
@@ -63,6 +74,22 @@ function Check-Text([string]$Output, [string]$Needle, [string]$Label) {
     Check $found $Label
     if (-not $found) { Write-Host ("        expected: {0}" -f $Needle) -ForegroundColor DarkYellow }
 }
+function New-ScratchVolume([string]$Path) {
+    New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    $letter = $null
+    foreach ($c in [char[]]'ZYXWVUTSRQPONMLKJIHGFED') {
+        if (Test-Path -LiteralPath ("{0}:\" -f $c)) { continue }
+        $letter = [string]$c
+        break
+    }
+    if (-not $letter) { throw 'No free drive letter for a scratch volume.' }
+    & subst.exe "${letter}:" $Path | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "${letter}:\")) {
+        throw "subst failed: ${letter}: -> $Path"
+    }
+    $script:scratchLetters += $letter
+    return $letter
+}
 function Invoke-LinkScript {
     param([string[]]$Extra = @())
     $lines = & powershell.exe -NoProfile -File $scriptPath -Root $root @Extra 2>&1
@@ -78,7 +105,7 @@ function Set-CreateDirectoriesDeny([string]$Path, [switch]$Remove) {
 }
 function Initialize-Scratch {
     foreach ($p in @($root, $profileDir)) {
-        if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }
+        if (Test-Path -LiteralPath $p) { throw "Refusing to reuse scratch path: $p" }
     }
     New-Item -ItemType Directory -Path (Join-Path $root 'registry'), (Join-Path $root 'shared\skills'), (Join-Path $root 'agents'), $profileDir -Force | Out-Null
 
@@ -110,8 +137,19 @@ function Initialize-Scratch {
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $root 'registry\migration-manifest.json') -Encoding UTF8
 }
 
-$denyActive = $false
 try {
+    $volumeDir = Join-Path $runRoot 'volume'
+    $rootLetter = New-ScratchVolume $volumeDir
+    # The linker requires an intermediate component: X:\<something>\agents.
+    $root = "${rootLetter}:\scratch\agents"
+    $profileDir = Join-Path $runRoot 'profile'
+    $claudeHome = Join-Path $root 'agents\claude'
+    $cursorHome = Join-Path $root 'agents\cursor'
+    $claudeSkills = Join-Path $claudeHome 'skills'
+    $linksPath = Join-Path $root 'registry\skill-links.json'
+    $dotSkill = Join-Path $root 'shared\skills\zz-dot.'
+    $dotSkillPhysical = Join-Path $volumeDir 'scratch\agents\shared\skills\zz-dot.'
+
     Initialize-Scratch
     Write-Host ''
     Write-Host '=== setup ==='
@@ -218,7 +256,7 @@ try {
     # so failing one skill needs a name Win32 cannot address. A trailing dot survives only
     # through a \\?\ path: it is listed as zz-dot., but New-Item resolves the target to
     # zz-dot and throws. Skills sorting before it still link.
-    [IO.Directory]::CreateDirectory('\\?\' + $dotSkill) | Out-Null
+    [IO.Directory]::CreateDirectory('\\?\' + $dotSkillPhysical) | Out-Null
     $out = Invoke-LinkScript -Extra @('-Apply', '-Agent', 'claude')
     Write-Host $out
     Check-Text $out 'LINK FAILED (+1 linked)' 'labels the partial failure with its linked count'
@@ -231,23 +269,31 @@ try {
     Check (@($claude.createdThisRun) -contains 'shared-demo') 'registry credits the created link'
 }
 finally {
-    if ($denyActive) {
+    if ($denyActive -and $claudeSkills) {
         try { Set-CreateDirectoriesDeny $claudeSkills -Remove } catch { Write-Host "WARNING: $($_.Exception.Message)" -ForegroundColor Yellow }
     }
     # A trailing-dot name cannot be removed through a Win32 path; drop it explicitly.
-    try { [IO.Directory]::Delete('\\?\' + $dotSkill, $true) }
-    catch [System.IO.DirectoryNotFoundException] { }
-    catch { Write-Host "WARNING: could not remove $dotSkill : $($_.Exception.Message)" -ForegroundColor Yellow }
-    foreach ($p in @($root, $profileDir)) {
-        if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }
+    if ($dotSkillPhysical) {
+        try { [IO.Directory]::Delete('\\?\' + $dotSkillPhysical, $true) }
+        catch [System.IO.DirectoryNotFoundException] { }
+        catch { Write-Host "WARNING: could not remove $dotSkillPhysical : $($_.Exception.Message)" -ForegroundColor Yellow }
     }
-    $scratchParent = Split-Path $root -Parent
-    if ((Test-Path -LiteralPath $scratchParent) -and -not (Get-ChildItem -LiteralPath $scratchParent -Force)) {
-        Remove-Item -LiteralPath $scratchParent -Force
+    foreach ($letter in $script:scratchLetters) { & subst.exe "${letter}:" /D | Out-Null }
+
+    $removable = $false
+    if (Test-Path -LiteralPath $sentinelPath) {
+        $token = (Get-Content -LiteralPath $sentinelPath -Raw).Trim()
+        $insideTemp = ([IO.Path]::GetFullPath($runRoot)).StartsWith($tempBase + '\', [StringComparison]::OrdinalIgnoreCase)
+        $removable = ($token -eq $runId) -and $insideTemp -and ((Split-Path $runRoot -Leaf) -like 'adm-link-harness-*')
+    }
+    if ($removable) { Remove-Item -LiteralPath $runRoot -Recurse -Force }
+    else { Write-Host "WARNING: sentinel mismatch; leaving scratch root $runRoot" -ForegroundColor Yellow }
+
+    Check (-not (Test-Path -LiteralPath $runRoot)) 'scratch root removed'
+    foreach ($letter in $script:scratchLetters) {
+        Check (-not (Test-Path -LiteralPath "${letter}:\")) ("scratch volume ${letter}: unmapped")
     }
     Write-Host ''
-    Write-Host ("leftovers root/profile : {0}/{1}" -f (Test-Path -LiteralPath $root), (Test-Path -LiteralPath $profileDir))
-    Write-Host ("leftovers parent       : {0}" -f (Test-Path -LiteralPath $scratchParent))
     Write-Host ("checks: {0} run, {1} failed" -f $script:checks, $script:failures)
 }
 if ($script:failures -gt 0) { exit 1 }
