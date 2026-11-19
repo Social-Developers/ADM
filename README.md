@@ -142,6 +142,14 @@ Check state:
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Status
 ```
 
+To exercise the migration phases without touching live agent data, run the scratch harness:
+
+```powershell
+powershell -NoProfile -File tests\Test-MigrateAgents.ps1
+```
+
+It builds a throwaway profile and a unique sentinel-guarded folder under `%TEMP%`, maps two free drive letters to folders inside it with `subst`, and runs an unblocked copy of the script there. It covers the refusal paths for Copy, Verify, Activate and Cleanup, plus recovery from interrupted copy, activation and cleanup. The volumes are unmapped and the folder removed at the end; no existing drive root, `Q:\_admtest` path or agent data is touched. Exit code 0 means every check passed.
+
 ### 6. Link shared skills (optional)
 
 `scripts\Link-SharedSkills.ps1` links the shared pool into each migrated agent's own skills directory. It reads `registry\migration-manifest.json`, confirms each legacy path is still a junction to its verified destination, and then **discovers** the agent's skills directory inside that destination (a directory named `skill` or `skills`, ignoring builtin, plugin, extension, staging and cache locations).
@@ -165,7 +173,7 @@ To exercise the linker without touching live agent directories, run the scratch 
 powershell -NoProfile -File tests\Test-LinkSharedSkills.ps1
 ```
 
-It builds a throwaway root under `<scratch drive>:\_admtest\agents` (default `Q:`, override with `-DriveLetter`) and a temporary profile under `%TEMP%\adm-link-harness-profile`, then runs the linker against them in child processes. It covers report-only, apply, idempotent re-apply, a forced junction failure, a partial run where earlier links are created before a later agent fails, and a same-agent partial failure that produces the `LINK FAILED (+N linked)` label. The temporary ACL deny rule and both trees are removed at the end; exit code 0 means every check passed.
+It builds a throwaway agents root and profile in a unique sentinel-guarded folder under `%TEMP%`, maps a free drive letter to that folder with `subst`, then runs the linker against them in child processes. It covers report-only, apply, idempotent re-apply, a forced junction failure, a partial run where earlier links are created before a later agent fails, and a same-agent partial failure that produces the `LINK FAILED (+N linked)` label. The temporary ACL deny rule, the volume mapping and the folder are removed at the end, and no existing drive root or `Q:\_admtest` path is touched; exit code 0 means every check passed.
 
 ### 7. Cleanup (optional, destructive)
 

@@ -92,6 +92,15 @@ For **each** migrated agent, independently check:
 
 If any agent cannot be launched or tested, label it **UNVERIFIED** and do not clean its source hold directory. You may use `-Agent <id>` for independently verified agents only.
 
+To rehearse the phases before touching live data, run the bundled migration harness:
+
+```powershell
+$harness = Join-Path $skillDirectory 'tests\Test-MigrateAgents.ps1'
+& $harness
+```
+
+It builds a throwaway profile and a unique sentinel-guarded folder under `%TEMP%`, maps two free drive letters to folders inside it with `subst`, and runs an unblocked copy of the script there. It covers the Copy, Verify, Activate and Cleanup refusal paths and recovery from interrupted copy, activation and cleanup, then unmaps the volumes and removes the folder. No existing drive root, `Q:\_admtest` path or agent data is touched; exit code 0 means every check passed. Run it only when the harness exists in the skill's `tests\` folder, and report its absence rather than reconstructing it.
+
 ## Cleanup: separately authorized, never implicit
 
 The user requesting a migration or asking the agent to “do everything” is **not** sufficient authorization to erase the source directories without showing exact deletion paths and asking for final confirmation.
@@ -138,10 +147,10 @@ To exercise the linker without touching real agent directories, run the bundled 
 
 ```powershell
 $harness = Join-Path $skillDirectory 'tests\Test-LinkSharedSkills.ps1'
-& $harness                      # scratch volume Q: by default; -DriveLetter overrides it
+& $harness
 ```
 
-It builds a throwaway root under `<scratch drive>:\_admtest\agents` and a temporary profile under `%TEMP%\adm-link-harness-profile`, then runs the linker against them in child processes. It covers report-only, apply, idempotent re-apply, a forced junction failure, a cross-agent partial run and a same-agent partial failure whose output carries `LINK FAILED (+N linked)`. The ACL deny rule and both trees are removed at the end, and nothing outside the scratch root and temp profile is touched; exit code 0 means every check passed. Run it only after confirming the harness exists in the skill's `tests\` folder; if it is missing, report that instead of reconstructing it.
+It builds a throwaway agents root and profile in a unique sentinel-guarded folder under `%TEMP%`, maps a free drive letter to that folder with `subst`, then runs the linker against them in child processes. It covers report-only, apply, idempotent re-apply, a forced junction failure, a cross-agent partial run and a same-agent partial failure whose output carries `LINK FAILED (+N linked)`. The ACL deny rule, the volume mapping and the folder are removed at the end, and no existing drive root or `Q:\_admtest` path is touched; exit code 0 means every check passed. Run it only after confirming the harness exists in the skill's `tests\` folder; if it is missing, report that instead of reconstructing it.
 
 Never replace agent-private skills with shared copies based solely on matching names, and do not copy credentials, private memories, or sessions into the shared pool. Agents with this skill should prefer `<DRIVE>:\agents` for supported persistent data and respect the legacy junctions. Do not promise universal enforcement across agents that do not have the skill installed or do not support relocation.
 
