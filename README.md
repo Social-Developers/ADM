@@ -140,7 +140,13 @@ This is a recovery step, not part of the normal sequence; use it when an agent f
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback
 ```
 
-Rollback requires `-ConfirmAgentsStopped` and `-ApproveRollback`. It verifies the hold, destination and legacy junction, refuses when the destination changed since activation, and removes only a junction that points at the recorded destination. It renames the hold back, records the time, returns the entry to `Verified`, and leaves the copied destination in place. It cannot recover an agent whose Cleanup already completed, because the hold is gone by then.
+Rollback requires `-ConfirmAgentsStopped` and `-ApproveRollback`. It verifies the hold, destination and legacy junction, and removes only a junction that points at the recorded destination. If the destination changed since activation, it prints a diff summary with added, removed and changed file counts and up to ten paths per category, then refuses unless you also pass `-AcceptDestinationChanges`. That switch proceeds with the rollback while keeping the changed destination in place; the manifest records `rolledBackWithChanges` and the counts under `destinationChanges`, alongside `rolledBackUtc`. Review the summary and preserve anything the agent wrote there before approving:
+
+```powershell
+.\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback -AcceptDestinationChanges
+```
+
+Rollback renames the hold back, records the time, returns the entry to `Verified`, and leaves the destination in place either way. It cannot recover an agent whose Cleanup already completed, because the hold is gone by then.
 
 ### 6. Test each agent
 

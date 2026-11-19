@@ -89,7 +89,13 @@ Use this instead of the normal sequence only when an agent fails after activatio
 & $scriptPath -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback
 ```
 
-Both switches are required. Rollback verifies the hold, destination and legacy junction, refuses when the destination changed since activation, removes only the junction that points at the recorded destination, and renames the hold back. The destination is left in place and the entry returns to `Verified`, so it can be activated again. It cannot recover an agent whose Cleanup already completed, because the hold no longer exists.
+Both switches are required. Rollback verifies the hold, destination and legacy junction and removes only the junction that points at the recorded destination. If the destination changed since activation, it prints a diff summary with added, removed and changed file counts and up to ten paths per category, and refuses. Show that summary to the user and preserve anything the agent wrote before rerunning with `-AcceptDestinationChanges`:
+
+```powershell
+& $scriptPath -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback -AcceptDestinationChanges
+```
+
+The changed destination is kept in place and the manifest records `rolledBackWithChanges` and the counts under `destinationChanges`, alongside `rolledBackUtc`. Rollback then renames the hold back, and the entry returns to `Verified`, so it can be activated again. Never add `-AcceptDestinationChanges` without showing the diff summary first. It cannot recover an agent whose Cleanup already completed, because the hold no longer exists.
 
 ## Operational verification before cleanup
 
