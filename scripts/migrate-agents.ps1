@@ -132,6 +132,25 @@ function Get-TreeDigest([string]$Path) {
         return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
     } finally { $sha.Dispose() }
 }
+function Get-SnapshotRequiredBytes([string]$Source) {
+    $bytes = [long]0
+    foreach ($f in @(Files-In $Source)) { $bytes += [long]$f.Length }
+    # One spare mebibyte keeps the copy itself from exhausting the volume.
+    return $bytes + 1MB
+}
+function Assert-SnapshotSpace([string]$Source, [string]$SnapshotRoot, [long]$AvailableBytes = -1) {
+    # The optional availability argument lets the harness test the refusal boundary
+    # without creating a nearly full volume; production callers omit it.
+    $required = Get-SnapshotRequiredBytes $Source
+    $volume = [IO.Path]::GetPathRoot((FullPath $SnapshotRoot))
+    if ($AvailableBytes -lt 0) {
+        $drive = New-Object -TypeName IO.DriveInfo -ArgumentList $volume
+        $AvailableBytes = $drive.AvailableFreeSpace
+        $volume = $drive.Name
+    }
+    Assert-Condition ($AvailableBytes -ge $required) (`
+            "Insufficient free space for destination snapshot on {0}: need {1} bytes, have {2}." -f $volume, $required, $AvailableBytes)
+}
 function Get-SnapshotProblems([object]$E) {
     $property = $E.PSObject.Properties['destinationSnapshot']
     if ($null -eq $property) { return @() }
@@ -392,10 +411,28 @@ switch ($Phase) {
                 else { Write-Warning "Destination changed since activation; keeping the changed destination at $($e.destination)." }
             }
             if ($diffCount -gt 0 -and $AcceptDestinationChanges -and -not $WhatIfPreference) {
-                $snapshot = Join-Path (Join-Path $script:Root 'migration\rollbacks') ($e.id + '-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'))
-                Copy-Tree $e.destination $snapshot
+                $rollbacks = Join-Path $script:Root 'migration\rollbacks'
+                New-Item -ItemType Directory -Path $rollbacks -Force | Out-Null
+                # A killed copy leaves only our staging folder; clear it before retrying.
+                foreach ($stale in @(Get-ChildItem -LiteralPath $rollbacks -Directory -Force -Filter '.incomplete-*')) {
+                    Remove-Item -LiteralPath $stale.FullName -Recurse -Force -ErrorAction Stop
+                }
+                Assert-SnapshotSpace $e.destination $rollbacks
+                $base = Join-Path $rollbacks ($e.id + '-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'))
+                $snapshot = $base
+                $suffix = 2
+                while (Test-Path -LiteralPath $snapshot) { $snapshot = "$base-$suffix"; $suffix++ }
+                $staging = Join-Path $rollbacks ('.incomplete-' + $e.id + '-' + [guid]::NewGuid().ToString('N'))
+                try {
+                    Copy-Tree $e.destination $staging
+                    $snapshotHash = Get-TreeDigest $staging
+                    Move-Item -LiteralPath $staging -Destination $snapshot -ErrorAction Stop
+                } catch {
+                    if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
+                    throw "Snapshot copy failed for $($e.id); no snapshot retained. $($_.Exception.Message)"
+                }
                 $e | Add-Member -NotePropertyName destinationSnapshot -NotePropertyValue $snapshot -Force
-                $e | Add-Member -NotePropertyName destinationSnapshotHash -NotePropertyValue (Get-TreeDigest $snapshot) -Force
+                $e | Add-Member -NotePropertyName destinationSnapshotHash -NotePropertyValue $snapshotHash -Force
                 Write-Host "Destination snapshot: $snapshot"
             }
             $sourceExists = Test-Path -LiteralPath $e.source
