@@ -65,7 +65,7 @@ function Get-ReparseTarget([string]$Path) {
     return (FullPath $target)
 }
 function Resolve-Root {
-    Assert-Condition (-not (-not [string]::IsNullOrWhiteSpace($Root) -and -not [string]::IsNullOrWhiteSpace($DriveLetter))) 'Specify either -Root or -DriveLetter, not both.'
+    Assert-Condition (([string]::IsNullOrWhiteSpace($Root)) -or ([string]::IsNullOrWhiteSpace($DriveLetter))) 'Specify either -Root or -DriveLetter, not both.'
     if (-not [string]::IsNullOrWhiteSpace($DriveLetter)) {
         $letter = $DriveLetter.TrimEnd(':').ToUpperInvariant()
         $script:RootPath = "${letter}:\agents"
@@ -86,15 +86,9 @@ $script:SkipSegments = '(?i)(^|\\)(node_modules|\.git|builtin|plugins?|extension
 function Find-SkillDirs([string]$Base, [int]$Depth = 3) {
     if (-not (Test-Path -LiteralPath $Base)) { return @() }
     $baseFull = FullPath $Base
-    $found = @(Get-ChildItem -LiteralPath $baseFull -Directory -Recurse -Depth $Depth -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^skills?$' })
-    $keep = @()
-    foreach ($d in $found) {
-        $rel = $d.FullName.Substring($baseFull.Length).Trim('\')
-        if ($rel -match $script:SkipSegments) { continue }
-        $keep += $d
-    }
-    return $keep
+    return @(Get-ChildItem -LiteralPath $baseFull -Directory -Recurse -Depth $Depth -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^skills?$' } |
+        Where-Object { $_.FullName.Substring($baseFull.Length).Trim('\') -notmatch $script:SkipSegments })
 }
 
 Assert-Condition ($env:OS -eq 'Windows_NT') 'Windows is required.'
@@ -160,49 +154,52 @@ $results = @()
 foreach ($t in @($targets | Sort-Object id)) {
     $status = ''
     $skillsDir = ''
-    $detail = ''
+    $reason = ''
     $linked = @()
+    $planned = @()
     $skipped = @()
 
     if ($t.linkable) {
         $target = Get-ReparseTarget $t.legacy
         if (-not $target) {
             $status = 'BLOCKED'
-            $detail = "legacy path is not a junction: $($t.legacy)"
+            $reason = "legacy path is not a junction: $($t.legacy)"
         } elseif ($target -ine (FullPath $t.home)) {
             $status = 'BLOCKED'
-            $detail = "legacy junction points elsewhere: $target"
+            $reason = "legacy junction points elsewhere: $target"
         }
     } else {
         $status = 'DRY RUN'
     }
 
-    if ($status -eq '' -or $status -eq 'DRY RUN') {
+    if ($status -ne 'BLOCKED') {
         $candidates = @(Find-SkillDirs -Base $t.home)
         if ($candidates.Count -eq 1) {
             $skillsDir = $candidates[0].FullName
             $status = 'CONFIRMED'
-            $detail = $skillsDir
         } elseif ($candidates.Count -eq 0) {
             $status = 'UNCONFIRMED'
-            $detail = 'no skill/skills directory found in this agent home'
+            $reason = 'no skill/skills directory found in this agent home'
         } else {
             $status = 'UNCONFIRMED'
-            $detail = 'ambiguous: ' + (($candidates | ForEach-Object { $_.FullName }) -join ' | ')
+            $reason = 'ambiguous: ' + (($candidates | ForEach-Object { $_.FullName }) -join ' | ')
         }
     }
 
     $ownLink = if ($skillsDir) { Get-ReparseTarget $skillsDir } else { '' }
     if ($skillsDir -and $ownLink) {
         $status = 'UNCONFIRMED'
-        $detail = "skills directory is itself a reparse point -> $ownLink; review manually"
+        $reason = "skills directory is itself a reparse point -> $ownLink; review manually"
     }
 
     if ($skillsDir -and $t.linkable -and $sharedSkills.Count -gt 0) {
         foreach ($s in $sharedSkills) {
             $dest = Join-Path $skillsDir $s.Name
             if (Test-Path -LiteralPath $dest) {
-                $skipped += $s.Name
+                $why = 'already present'
+                $destTarget = Get-ReparseTarget $dest
+                if ($destTarget -and ($destTarget -ieq (FullPath $s.FullName))) { $why = 'already linked' }
+                $skipped += [pscustomobject]@{ name = $s.Name; why = $why }
                 continue
             }
             if ($Apply) {
@@ -211,11 +208,11 @@ foreach ($t in @($targets | Sort-Object id)) {
                     $linked += $s.Name
                 } catch {
                     $status = 'LINK FAILED'
-                    $detail = $_.Exception.Message
+                    $reason = $_.Exception.Message
                     break
                 }
             } else {
-                $skipped += $s.Name
+                $planned += $s.Name
             }
         }
     }
@@ -237,26 +234,38 @@ foreach ($t in @($targets | Sort-Object id)) {
         home      = $t.home
         skillsDir = $skillsDir
         status    = $status
-        detail    = $detail
         linked    = @($linked)
+        planned   = @($planned)
         linkedNow = @($linkedNow)
-        skipped   = @($skipped)
+        skipped   = @($skipped | ForEach-Object { $_.name })
     }
 
     $label = if ($linked.Count -gt 0) { "$status (+$($linked.Count) linked)" } else { $status }
-    Write-Host ("{0,-9} {1,-14} {2}" -f $t.id, $label, $(if ($detail) { $detail } else { $skillsDir }))
-    if ($linked.Count -gt 0) { Write-Host ("          linked : {0}" -f ($linked -join ', ')) -ForegroundColor Green }
-    if ($skipped.Count -gt 0 -and $Apply) { Write-Host ("          skipped: {0} (already present)" -f ($skipped -join ', ')) -ForegroundColor DarkYellow }
+    Write-Host ("{0,-9} {1,-14} {2}" -f $t.id, $label, $(if ($skillsDir) { $skillsDir } else { $reason }))
+    if ($reason -and $skillsDir) { Write-Host ("          reason    : {0}" -f $reason) -ForegroundColor Yellow }
+    if ($planned.Count -gt 0) { Write-Host ("          would link: {0}" -f ($planned -join ', ')) -ForegroundColor Cyan }
+    if ($linked.Count -gt 0) { Write-Host ("          linked    : {0}" -f ($linked -join ', ')) -ForegroundColor Green }
+    if ($skipped.Count -gt 0) {
+        $skipLabel = if ($Apply) { 'skipped   ' } else { 'would skip' }
+        $notes = @($skipped | ForEach-Object { "{0} ({1})" -f $_.name, $_.why })
+        Write-Host ("          {0}: {1}" -f $skipLabel, ($notes -join ', ')) -ForegroundColor DarkYellow
+    }
 }
 
-$confirmed = @($results | Where-Object { $_.status -eq 'CONFIRMED' -or $_.status -eq 'LINK FAILED' -or $_.linked.Count -gt 0 })
+$confirmed = @($results | Where-Object { $_.status -eq 'CONFIRMED' })
+$failed = @($results | Where-Object { $_.status -eq 'LINK FAILED' })
 $unconfirmed = @($results | Where-Object { $_.status -eq 'UNCONFIRMED' })
 $blocked = @($results | Where-Object { $_.status -eq 'BLOCKED' })
-$created = @($results | ForEach-Object { $_.linked }).Count
+$linkedCount = @($results | ForEach-Object { $_.linked }).Count
+$plannedCount = @($results | ForEach-Object { $_.planned }).Count
 
 Write-Host ''
-Write-Host ("summary: confirmed={0} unconfirmed={1} blocked={2} links {3}={4}" -f `
-    $confirmed.Count, $unconfirmed.Count, $blocked.Count, $(if ($Apply) { 'created' } else { 'planned' }), $created)
+Write-Host ("summary: confirmed={0} failed={1} unconfirmed={2} blocked={3} links {4}={5}" -f `
+    $confirmed.Count, $failed.Count, $unconfirmed.Count, $blocked.Count, `
+    $(if ($Apply) { 'created' } else { 'planned' }), $(if ($Apply) { $linkedCount } else { $plannedCount }))
+if ($failed.Count -gt 0) {
+    Write-Host ("LINK FAILED: {0}" -f (($failed | ForEach-Object { $_.id }) -join ', ')) -ForegroundColor Red
+}
 if ($unconfirmed.Count -gt 0) {
     Write-Host ("UNCONFIRMED: {0}" -f (($unconfirmed | ForEach-Object { $_.id }) -join ', ')) -ForegroundColor Yellow
     Write-Host 'No link was created for these agents. Confirm the real skills path from the agent''s own documentation before linking.'
