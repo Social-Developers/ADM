@@ -287,6 +287,11 @@ switch ($Phase) {
     'Status' {
         $report = @()
         $issueCount = 0
+        $rollbacks = Join-Path $script:Root 'migration\rollbacks'
+        $orphanStaging = @()
+        if (Test-Path -LiteralPath $rollbacks -PathType Container) {
+            $orphanStaging = @(Get-ChildItem -LiteralPath $rollbacks -Directory -Force -Filter '.incomplete-*')
+        }
         foreach ($e in $entries) {
             $problems = @()
             $destination = if (Test-Path -LiteralPath $e.destination -PathType Container) { 'present' } else { 'missing' }
@@ -328,6 +333,10 @@ switch ($Phase) {
             }
         }
         $report | Format-Table id, state, destination, hold, legacy, issues -AutoSize
+        if ($orphanStaging.Count -gt 0) {
+            $issueCount += $orphanStaging.Count
+            Write-Warning ("Orphaned snapshot staging folder(s) under {0}: {1}" -f $rollbacks, (($orphanStaging | ForEach-Object { $_.Name }) -join ', '))
+        }
         if ($issueCount -gt 0) { Write-Warning ("Status found {0} issue(s); reconcile them before the next phase." -f $issueCount) }
         else { Write-Host 'Status: manifest matches disk for the selected agents.' }
         break
