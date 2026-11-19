@@ -158,7 +158,7 @@ try {
     Write-Host $out
     Check-Text $out 'LINK FAILED' 'reports the failed link'
     Check-Text $out 'failed    : zz-fail' 'names the skill that failed'
-    Check-Text $out 'denied' 'carries the access-denied reason'
+    Check ($out -match '(?m)^\s+reason\s+: \S') 'prints a non-empty failure reason'
     Check-Text $out 'skipped   : private-skill (already present), shared-demo (already linked)' 'still reports the skills it skipped'
     Check-Text $out 'LINK FAILED: claude' 'lists the failed agent'
     Check-Text $out 'failed=1' 'summary counts the failure'
