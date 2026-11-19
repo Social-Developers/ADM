@@ -52,7 +52,6 @@ $claudeHome = ''
 $cursorHome = ''
 $claudeSkills = ''
 $linksPath = ''
-$dotSkill = ''
 $dotSkillPhysical = ''
 $denyActive = $false
 $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -84,10 +83,11 @@ function New-ScratchVolume([string]$Path) {
     }
     if (-not $letter) { throw 'No free drive letter for a scratch volume.' }
     & subst.exe "${letter}:" $Path | Out-Null
+    # Record before verifying, so a failed mapping is still unmapped during cleanup.
+    $script:scratchLetters += $letter
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "${letter}:\")) {
         throw "subst failed: ${letter}: -> $Path"
     }
-    $script:scratchLetters += $letter
     return $letter
 }
 function Invoke-LinkScript {
@@ -104,9 +104,6 @@ function Set-CreateDirectoriesDeny([string]$Path, [switch]$Remove) {
     if ($LASTEXITCODE -ne 0) { throw "icacls failed with $LASTEXITCODE on $Path." }
 }
 function Initialize-Scratch {
-    foreach ($p in @($root, $profileDir)) {
-        if (Test-Path -LiteralPath $p) { throw "Refusing to reuse scratch path: $p" }
-    }
     New-Item -ItemType Directory -Path (Join-Path $root 'registry'), (Join-Path $root 'shared\skills'), (Join-Path $root 'agents'), $profileDir -Force | Out-Null
 
     foreach ($s in @('shared-demo', 'private-skill')) {
@@ -147,7 +144,6 @@ try {
     $cursorHome = Join-Path $root 'agents\cursor'
     $claudeSkills = Join-Path $claudeHome 'skills'
     $linksPath = Join-Path $root 'registry\skill-links.json'
-    $dotSkill = Join-Path $root 'shared\skills\zz-dot.'
     $dotSkillPhysical = Join-Path $volumeDir 'scratch\agents\shared\skills\zz-dot.'
 
     Initialize-Scratch
@@ -278,6 +274,7 @@ finally {
         catch [System.IO.DirectoryNotFoundException] { }
         catch { Write-Host "WARNING: could not remove $dotSkillPhysical : $($_.Exception.Message)" -ForegroundColor Yellow }
     }
+    # Unmap first so deleting the tree cannot traverse junctions into their targets.
     foreach ($letter in $script:scratchLetters) { & subst.exe "${letter}:" /D | Out-Null }
 
     $removable = $false
