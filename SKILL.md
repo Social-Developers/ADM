@@ -95,7 +95,11 @@ Both switches are required. Rollback verifies the hold, destination and legacy j
 & $scriptPath -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback -AcceptDestinationChanges
 ```
 
-The changed destination is kept in place and the manifest records `rolledBackWithChanges` and the counts under `destinationChanges`, alongside `rolledBackUtc`. Rollback then renames the hold back, and the entry returns to `Verified`, so it can be activated again. Never add `-AcceptDestinationChanges` without showing the diff summary first. It cannot recover an agent whose Cleanup already completed, because the hold no longer exists.
+The changed destination is kept in place and copied to `<DRIVE>:\agents\migration\rollbacks\<agent>-<UTC timestamp>`; the copy is verified, and the manifest records `destinationSnapshot`, `rolledBackWithChanges`, the counts under `destinationChanges` and `rolledBackUtc`. Each approved rollback with a non-empty diff gets its own folder. Snapshots are never pruned automatically and Cleanup does not remove them: keep them until the preserved data has been reconciled or is no longer needed, and tell the user where they are. `-WhatIf` creates no snapshot. Rollback then renames the hold back, and the entry returns to `Verified`, so it can be activated again. Never add `-AcceptDestinationChanges` without showing the diff summary first. It cannot recover an agent whose Cleanup already completed, because the hold no longer exists.
+
+### Previewing moves and deletions
+
+Activate, Rollback and Cleanup accept `-WhatIf`. A preview performs the same read-only checks and reports the planned rename, junction, backup or deletion, but does not require the phase's approval switches: omit `-ConfirmAgentsStopped` and `-ApproveRollback` for Rollback, `-ConfirmAgentsValidated` and `-ApproveDeletion` for Cleanup, and `-BackupRoot` for a Cleanup preview. It changes no files and leaves the manifest untouched, so use it to show the user exactly what a phase would do before asking for approval.
 
 ## Operational verification before cleanup
 
@@ -126,6 +130,8 @@ The user requesting a migration or asking the agent to “do everything” is **
 Before cleanup, show the user the list of exact `*.qagents-migration-hold` paths to be deleted, the verified backup destination, and the result of the operational tests. Ask for explicit approval to delete those paths. Never delete the legacy junctions, the destination, a project directory, or a parent user profile directory.
 
 Require an existing, writable **independent** backup location on a different physical storage device where practical. The script checks drive letters, not physical-device independence: independently confirm this before proceeding. The script creates and hash-verifies a backup during Cleanup; ensure sufficient free space on the backup drive.
+
+If an interrupted Cleanup was followed by a Rollback, the verified backup can still exist. Rerunning Cleanup with the same `-BackupRoot` reuses it after confirming it matches the hold rather than refusing. A backup that differs from the hold is refused and left untouched; reconcile it instead of overwriting.
 
 Only after explicit approval and all required validation:
 

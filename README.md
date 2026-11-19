@@ -62,7 +62,8 @@ The target layout is:
 │   └── skills.json
 ├── migration\
 │   ├── reports\
-│   └── logs\
+│   ├── logs\
+│   └── rollbacks\
 └── backups\
 ```
 
@@ -95,6 +96,8 @@ Before migration, the skill **asks which drive letter you want to use**. Enter a
 ## Manual workflow
 
 Open PowerShell in the extracted repository directory. Select a drive first, for example `$driveLetter = 'D'`, and use the same letter for all phases. These phases must be run **in order**. Each command should complete without an error before continuing.
+
+Activate, Rollback and Cleanup accept `-WhatIf`. A preview runs the same read-only validation but does not require their approval switches: `-ConfirmAgentsStopped` and `-ApproveRollback` are skipped for Rollback, `-ConfirmAgentsValidated` and `-ApproveDeletion` for Cleanup, and `-BackupRoot` is optional for a Cleanup preview. It reports what would be renamed, linked or deleted and changes no files or manifest state.
 
 ### 1. Inventory
 
@@ -145,6 +148,8 @@ Rollback requires `-ConfirmAgentsStopped` and `-ApproveRollback`. It verifies th
 ```powershell
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback -AcceptDestinationChanges
 ```
+
+When the switch is used and the diff is non-empty, Rollback first copies the changed destination to `<DRIVE>:\agents\migration\rollbacks\<agent>-<UTC timestamp>`, verifies the copy, and records its path as `destinationSnapshot` in the manifest. Each approved rollback gets its own folder. Snapshots are retained deliberately: the script never prunes them, and Cleanup does not remove them. Keep each snapshot until its contents have been reconciled or are no longer needed. `-WhatIf` never creates one.
 
 Rollback renames the hold back, records the time, returns the entry to `Verified`, and leaves the destination in place either way. It cannot recover an agent whose Cleanup already completed, because the hold is gone by then.
 
@@ -205,6 +210,8 @@ It builds a throwaway agents root and profile in a unique sentinel-guarded folde
 ```
 
 Cleanup copies the hold directory to the backup root, verifies it, rechecks the destination, and then deletes the verified hold directory. **The script only checks that the backup uses a different drive letter; you must confirm physical independence yourself.** It does not independently detect active agent processes or confirm application tests. Never pass the confirmation switches unless those checks have actually been completed.
+
+If a rollback followed an interrupted Cleanup, its verified backup may still exist. Rerunning Cleanup with the same `-BackupRoot` reuses that backup after confirming it matches the hold, instead of refusing. A backup that differs from the hold is refused and left untouched. Cleanup does not verify, prune or delete snapshots under `migration\rollbacks`.
 
 To limit operations to one agent, add `-Agent claude` (or `codex`, `gemini`, `cursor`, `opencode`) to the relevant phase. The selected agent must already exist in the migration manifest.
 
