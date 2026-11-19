@@ -158,6 +158,7 @@ foreach ($t in @($targets | Sort-Object id)) {
     $linked = @()
     $planned = @()
     $skipped = @()
+    $failedSkill = ''
 
     if ($t.linkable) {
         $target = Get-ReparseTarget $t.legacy
@@ -208,6 +209,7 @@ foreach ($t in @($targets | Sort-Object id)) {
                     $linked += $s.Name
                 } catch {
                     $status = 'LINK FAILED'
+                    $failedSkill = $s.Name
                     $reason = $_.Exception.Message
                     break
                 }
@@ -242,6 +244,7 @@ foreach ($t in @($targets | Sort-Object id)) {
 
     $label = if ($linked.Count -gt 0) { "$status (+$($linked.Count) linked)" } else { $status }
     Write-Host ("{0,-9} {1,-14} {2}" -f $t.id, $label, $(if ($skillsDir) { $skillsDir } else { $reason }))
+    if ($failedSkill) { Write-Host ("          failed    : {0}" -f $failedSkill) -ForegroundColor Red }
     if ($reason -and $skillsDir) { Write-Host ("          reason    : {0}" -f $reason) -ForegroundColor Yellow }
     if ($planned.Count -gt 0) { Write-Host ("          would link: {0}" -f ($planned -join ', ')) -ForegroundColor Cyan }
     if ($linked.Count -gt 0) { Write-Host ("          linked    : {0}" -f ($linked -join ', ')) -ForegroundColor Green }
