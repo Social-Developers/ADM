@@ -79,12 +79,6 @@ function New-ScratchVolume([string]$Path) {
 }
 function Read-Manifest { return (Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json) }
 function Read-Entry([string]$Id) { return @((Read-Manifest).entries | Where-Object { $_.id -eq $Id })[0] }
-function Set-EntryState([string]$Id, [string]$State) {
-    $m = Read-Manifest
-    ($m.entries | Where-Object { $_.id -eq $Id }).state = $State
-    $m.updatedUtc = [DateTime]::UtcNow.ToString('o')
-    [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json -InputObject $m -Depth 15), (New-Object Text.UTF8Encoding($false)))
-}
 
 $runId = [guid]::NewGuid().ToString('N')
 $tempBase = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
@@ -324,9 +318,21 @@ try {
     Check ((Read-Entry 'cursor').state -eq 'Complete') 'cleanup records cursor as Complete'
     Check (Test-Path -LiteralPath (Join-Path $cursorSource 'notes.txt')) 'cleanup leaves the junction readable'
 
-    # Interrupted cleanup: backup already verified and recorded, hold still present.
-    Copy-Item -LiteralPath $claudeHold -Destination $claudeBackup -Recurse -Force
-    Set-EntryState 'claude' 'BackupVerified'
+    # Genuine interruption: every hold file is open without delete sharing, so the backup
+    # is copied and verified and the state is saved, but Remove-Item cannot delete the hold.
+    $holdHandles = @()
+    try {
+        foreach ($f in @(Get-ChildItem -LiteralPath $claudeHold -Recurse -File)) {
+            $holdHandles += [IO.File]::Open($f.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        }
+        $out = Invoke-Migrate @('-Phase', 'Cleanup', '-Agent', 'claude', '-DriveLetter', $rootLetter, '-ConfirmAgentsValidated', '-ApproveDeletion', '-BackupRoot', $backupRoot) -ExpectFailure
+        Check (Test-Path -LiteralPath $claudeHold) 'failed cleanup keeps the hold'
+        Check (Test-Path -LiteralPath $claudeBackup) 'failed cleanup keeps the verified backup'
+        Check ((Read-Entry 'claude').state -eq 'BackupVerified') 'failed cleanup records BackupVerified'
+    }
+    finally {
+        foreach ($handle in $holdHandles) { $handle.Dispose() }
+    }
     $out = Invoke-Migrate @('-Phase', 'Cleanup', '-Agent', 'claude', '-DriveLetter', $rootLetter, '-ConfirmAgentsValidated', '-ApproveDeletion', '-BackupRoot', $backupRoot)
     Check (-not (Test-Path -LiteralPath $claudeHold)) 'resumed cleanup removes the remaining hold'
     Check (Test-Path -LiteralPath $claudeBackup) 'resumed cleanup reuses the verified backup'
