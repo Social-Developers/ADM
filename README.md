@@ -14,6 +14,7 @@ A Windows PowerShell skill for consolidating supported AI coding-agent **user da
 - Keeps the original directory as a sibling `*.qagents-migration-hold` during validation.
 - Creates an inventory of private skills and a shared-skills directory.
 - Requires a separate, verified backup and explicit approval before deleting held originals.
+- Optionally links entries from the shared skills pool into each migrated agent's own skills directory, discovering that directory per agent and reporting any agent whose location cannot be confirmed.
 
 It does **not** move application executables, migrate project repositories or project-local rules, discover every custom installation, or automatically deduplicate and install skills across agents.
 
@@ -36,7 +37,8 @@ agent-directory-migration/
 ├── README.md
 ├── SKILL.md
 └── scripts/
-    └── migrate-agents.ps1
+    ├── migrate-agents.ps1
+    └── Link-SharedSkills.ps1
 ```
 
 The target layout is:
@@ -140,7 +142,24 @@ Check state:
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Status
 ```
 
-### 6. Cleanup (optional, destructive)
+### 6. Link shared skills (optional)
+
+`scripts\Link-SharedSkills.ps1` links the shared pool into each migrated agent's own skills directory. It reads `registry\migration-manifest.json`, confirms each legacy path is still a junction to its verified destination, and then **discovers** the agent's skills directory inside that destination (a directory named `skill` or `skills`, ignoring builtin, plugin, extension, staging and cache locations).
+
+```powershell
+.\scripts\Link-SharedSkills.ps1 -DriveLetter $driveLetter          # report only
+.\scripts\Link-SharedSkills.ps1 -DriveLetter $driveLetter -Apply    # create junctions
+```
+
+Each shared skill becomes one junction inside the agent's skills directory. Existing entries are never overwritten and private skills are never replaced. An agent is linked only when exactly one skills directory is found; agents with none, or with several, are listed as `UNCONFIRMED` and left untouched, and agents whose junction is missing are listed as `BLOCKED`. There is no built-in path table to guess from. Results are written to `registry\skill-links.json`.
+
+For a dry run before activation exists, classify unlinked homes explicitly:
+
+```powershell
+.\scripts\Link-SharedSkills.ps1 -IncludeHome "$env:USERPROFILE\.claude;$env:USERPROFILE\.codex"
+```
+
+### 7. Cleanup (optional, destructive)
 
 **Only after independent operational testing**, identify the exact hold directories proposed for deletion and explicitly approve them. Supply an existing backup root on an independent device; `R:` below is just an example:
 
@@ -170,7 +189,7 @@ If a step fails, **stop**. Do not manually delete hold directories, rerun Invent
 ## Known limitations
 
 - Only the five user-level discovery paths above are implemented. Project-specific configurations, custom paths, and additional agents are out of scope.
-- The shared-skills folder and `skills.json` inventory are created, but there is no automatic skill deduplication, compatibility conversion, or cross-agent installation.
+- The shared-skills folder and `skills.json` inventory are created, and linking them into agents is opt-in through `Link-SharedSkills.ps1`. There is no automatic deduplication, compatibility conversion, or content rewriting, and an agent whose skills directory cannot be identified unambiguously is reported `UNCONFIRMED` instead of being linked.
 - Hash checks verify file contents, not every filesystem property (for example alternate data streams, ownership, all ACL semantics, or sparse-file details).
 - The script does not calculate free-space requirements, detect active processes, or perform agent startup tests automatically. The skill instructs the operator/agent to perform these checks separately.
 - The script has no general-purpose automated rollback command. Failed operations may require careful manual recovery.

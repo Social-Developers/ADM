@@ -9,15 +9,17 @@ description: Migrate supported Windows AI agent user data into <DRIVE>:\agents u
 
 Use the **bundled** `scripts/migrate-agents.ps1` as the sole migration engine. Its canonical target is `<DRIVE>:\agents`, with one directory per supported agent in `<DRIVE>:\agents\agents\<id>`, and a shared skill directory at `<DRIVE>:\agents\shared\skills`. Do not implement ad hoc copy/move/delete commands in place of the script.
 
-The bundled implementation supports **user-profile** directories for `claude`, `codex`, `gemini`, `cursor`, and `opencode` (see `Discover` in the script for exact source paths). It does **not** relocate application binaries, all AppData trees, project-level instructions, repositories, custom agent paths, or unknown agents. The shared pool is created and a skills inventory is written, but skills are **not automatically deduplicated or installed across agents**; compatibility must be assessed separately. Never claim otherwise.
+Shared-skill linkage is likewise a bundled step: use `scripts\Link-SharedSkills.ps1` rather than hand-creating skill links or repeated `New-Item -ItemType Junction` commands of your own.
+
+The bundled implementation supports **user-profile** directories for `claude`, `codex`, `gemini`, `cursor`, and `opencode` (see `Discover` in the script for exact source paths). It does **not** relocate application binaries, all AppData trees, project-level instructions, repositories, custom agent paths, or unknown agents. The migration script creates the shared pool and a skills inventory, but it never deduplicates, converts, or installs skills across agents; compatibility must be assessed separately. Linking is a separate, explicitly invoked step performed by `scripts\Link-SharedSkills.ps1`, which discovers each agent's own skills directory and refuses to guess. Never claim automatic cross-agent skill installation.
 
 ## Starting from Downloads
 
 When invoked and the current working directory is the user's default Downloads folder, or the user says the skill and script were downloaded:
 
 1. Resolve Downloads using `[Environment]::GetFolderPath('UserProfile')` plus `Downloads` **as a candidate**, and also inspect the current working directory. Downloads may be redirected; do not assume it is always under the profile.
-2. Find the exact installed skill directory and its `scripts\migrate-agents.ps1`. Prefer the script **adjacent to this SKILL.md**. If only `migrate-agents.ps1` is present in Downloads, inspect its content and ensure it matches the expected script before using it. Never silently run an arbitrary similarly named script.
-3. If the user downloaded the ZIP package, extract it into a dedicated `agent-directory-migration` directory, preserving `SKILL.md` and `scripts\migrate-agents.ps1` together. Avoid extracting over an existing directory without reviewing conflicts.
+2. Find the exact installed skill directory and its `scripts\migrate-agents.ps1` and `scripts\Link-SharedSkills.ps1`. Prefer the scripts **adjacent to this SKILL.md**. If only `migrate-agents.ps1` is present in Downloads, inspect its content and ensure it matches the expected script before using it. Never silently run an arbitrary similarly named script, and do not substitute a locally rewritten linkage script for the bundled one.
+3. If the user downloaded the ZIP package, extract it into a dedicated `agent-directory-migration` directory, preserving `SKILL.md` and both files under `scripts\` together. Avoid extracting over an existing directory without reviewing conflicts.
 4. Inspect the script and verify its SHA-256 against a trusted, independently supplied digest if available. A digest shipped in the same ZIP is useful for detecting accidental corruption, **not** for authenticating the download.
 5. Use a full absolute script path for all invocations. Do not require the user to change working directory.
 6. Never use `Invoke-Expression`, remote script downloads, `-ExecutionPolicy Bypass`, or unreviewed privilege elevation as a shortcut.
@@ -114,9 +116,25 @@ After cleanup, run Status, test the legacy junction again, and record the bytes 
 
 ## Shared skills and ongoing use
 
-The script creates `<DRIVE>:\agents\shared\skills` and `<DRIVE>:\agents\registry\skills.json`, but it does not rewrite every agent's native skill discovery path. To enable a shared skill for an agent, determine that agent's **documented** skill installation/search mechanism and create a compatible reference or adapter only after verifying it. Never replace agent-private skills with shared copies based solely on matching names. Do not copy credentials, private memories, or sessions to the shared pool.
+The migration script creates `<DRIVE>:\agents\shared\skills` and `<DRIVE>:\agents\registry\skills.json`, but it does not rewrite any agent's native skill discovery path. Linkage is a separate step performed by the bundled `scripts\Link-SharedSkills.ps1`.
 
-Agents with this skill should prefer `<DRIVE>:\agents` for supported persistent data and respect the legacy junctions. Do not promise universal enforcement across agents that do not have the skill installed or do not support relocation.
+That helper is **manifest-driven and discovery-based**. It contains no per-agent skills path table, so it never links into a path nobody verified:
+
+1. It reads `<DRIVE>:\agents\registry\migration-manifest.json` and takes each entry's `source` (the legacy path) and `destination`.
+2. It requires the legacy path to be a junction whose target is that entry's `destination`. Entries whose junction is missing or redirected are reported `BLOCKED` and skipped.
+3. It finds the agent's own skills directory inside the destination by searching for a directory named `skill` or `skills` (depth 3), excluding `builtin`, `plugins`, `extensions`, `.tmp`, `staging`, caches, sessions, projects and logs, so vendored plugin skills are not mistaken for the agent's own.
+4. Exactly one candidate is `CONFIRMED`. Zero candidates, or several, are `UNCONFIRMED`: report the agent and create no link for it.
+5. For a confirmed agent, each directory in the shared pool becomes one junction inside that skills directory. Existing names are skipped, never overwritten, and the whole skills directory is never replaced, so agent-private skills stay visible.
+
+```powershell
+$linkScript = Join-Path $skillDirectory 'scripts\Link-SharedSkills.ps1'
+& $linkScript -DriveLetter $driveLetter          # report only
+& $linkScript -DriveLetter $driveLetter -Apply    # create junctions
+```
+
+Always run the report-only form first and read the `CONFIRMED` / `UNCONFIRMED` / `BLOCKED` table. Run the helper only after `Activate`, or use `-IncludeHome` for a dry run against unlinked homes. Never invent a skills path for an `UNCONFIRMED` agent: confirm the real location from that agent's own documentation, then pass it with `-IncludeHome` to see how it classifies before linking. Results are recorded in `<DRIVE>:\agents\registry\skill-links.json`.
+
+Never replace agent-private skills with shared copies based solely on matching names, and do not copy credentials, private memories, or sessions into the shared pool. Agents with this skill should prefer `<DRIVE>:\agents` for supported persistent data and respect the legacy junctions. Do not promise universal enforcement across agents that do not have the skill installed or do not support relocation.
 
 ## Recovery and error handling
 
@@ -129,4 +147,4 @@ Agents with this skill should prefer `<DRIVE>:\agents` for supported persistent 
 
 ## Completion report
 
-Report which agents were discovered, copied, hash-verified, activated, operationally tested, and cleaned. Include unresolved paths, backup location, shared skill inventory status, and actual disk-space recovery. Use `COMPLETE` only for fully validated in-scope agents. Otherwise report `PARTIAL` or `FAILED` with reasons.
+Report which agents were discovered, copied, hash-verified, activated, operationally tested, and cleaned. Include unresolved paths, backup location, shared skill inventory status, which agents were linked, which were reported `UNCONFIRMED` or `BLOCKED`, and actual disk-space recovery. Use `COMPLETE` only for fully validated in-scope agents. Otherwise report `PARTIAL` or `FAILED` with reasons.
