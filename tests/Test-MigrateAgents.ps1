@@ -212,6 +212,37 @@ try {
     Check ($out.Contains('Verified: claude')) 'verify accepts the hold after activation'
 
     Write-Host ''
+    Write-Host '=== status reconciliation ==='
+    $out = Invoke-Migrate @('-Phase', 'Status', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status agrees with a healthy state'
+
+    [IO.Directory]::Delete($claudeSource)
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'legacy junction missing' 'status reports a missing legacy junction'
+    New-Item -ItemType Junction -Path $claudeSource -Target $claudeDest | Out-Null
+
+    [IO.Directory]::Delete($claudeSource)
+    $decoy = Join-Path $root 'agents\decoy-status'
+    New-Item -ItemType Directory -Path $decoy -Force | Out-Null
+    New-Item -ItemType Junction -Path $claudeSource -Target $decoy | Out-Null
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'legacy junction redirected' 'status reports a redirected junction'
+    [IO.Directory]::Delete($claudeSource)
+    New-Item -ItemType Junction -Path $claudeSource -Target $claudeDest | Out-Null
+
+    Rename-Item -LiteralPath $claudeHold -NewName ([IO.Path]::GetFileName($claudeHold) + '.away')
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'hold missing' 'status reports a missing hold'
+    Rename-Item -LiteralPath ($claudeHold + '.away') -NewName ([IO.Path]::GetFileName($claudeHold))
+
+    Rename-Item -LiteralPath $claudeDest -NewName 'claude.away'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'destination missing or unavailable' 'status reports an unavailable destination'
+    Rename-Item -LiteralPath (Join-Path $root 'agents\claude.away') -NewName 'claude'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status agrees again after the restores'
+
+    Write-Host ''
     Write-Host '=== rollback ==='
     $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-DriveLetter', $rootLetter) -ExpectFailure
     Check-Text $out 'ConfirmAgentsStopped' 'rollback requires the stopped-agent switch'
@@ -307,6 +338,8 @@ try {
     Check (Test-Path -LiteralPath (Join-Path $cursorSource 'notes.txt')) 'cursor destination survives cleanup'
     Check ((Read-Entry 'gemini').state -eq 'Inventoried') 'untouched agent keeps its state'
     Check ((Read-Manifest).schema -eq 1) 'manifest schema is unchanged'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status agrees after cleanup'
 }
 finally {
     $env:USERPROFILE = $realProfile
