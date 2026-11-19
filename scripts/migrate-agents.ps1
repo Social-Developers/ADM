@@ -3,7 +3,7 @@
 .SYNOPSIS
   Conservative Windows agent-data migration to a user-selected drive\agents.
 .DESCRIPTION
-  Phases: Inventory, Copy, Verify, Activate, Cleanup, Status.
+  Phases: Inventory, Copy, Verify, Activate, Rollback, Cleanup, Status.
   Activation creates legacy-path junctions after moving the original directories
   to same-volume hold directories. Cleanup requires independent verified backup.
   This script does not relocate application binaries or project repositories.
@@ -12,6 +12,7 @@
   .\migrate-agents.ps1 -Phase Copy
   .\migrate-agents.ps1 -Phase Verify
   .\migrate-agents.ps1 -Phase Activate -Agent claude -ConfirmAgentsStopped
+  .\migrate-agents.ps1 -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback
   .\migrate-agents.ps1 -Phase Cleanup -Agent claude -BackupRoot 'R:\agent-migration-backup' -ConfirmAgentsValidated -ApproveDeletion
 #>
 [CmdletBinding()]

@@ -132,15 +132,17 @@ For each selected agent, the original directory is renamed to a sibling hold dir
 
 **The switch asserts that you checked the agents are stopped; it does not stop processes automatically.**
 
-If an agent fails after activation, use the Rollback phase instead of hand-editing junctions:
+### 5. Rollback (optional, recovery)
+
+This is a recovery step, not part of the normal sequence; use it when an agent fails after activation instead of hand-editing junctions:
 
 ```powershell
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback
 ```
 
-Rollback requires both switches. It verifies the hold, destination and legacy junction, refuses when the destination changed since activation, and removes only a junction that points at the recorded destination. It renames the hold back, records the time, returns the entry to `Verified`, and leaves the copied destination in place. It cannot recover an agent whose Cleanup already completed, because the hold is gone by then.
+Rollback requires `-ConfirmAgentsStopped` and `-ApproveRollback`. It verifies the hold, destination and legacy junction, refuses when the destination changed since activation, and removes only a junction that points at the recorded destination. It renames the hold back, records the time, returns the entry to `Verified`, and leaves the copied destination in place. It cannot recover an agent whose Cleanup already completed, because the hold is gone by then.
 
-### 5. Test each agent
+### 6. Test each agent
 
 Launch each affected agent and confirm that its settings, private skills, memories, and plugins work. Make a disposable write through its usual data path and confirm the data reaches the selected drive. Remove the test file and reconcile any newly written files against the held original. A strict comparison may fail if the destination changed after activation; do not overwrite new user data to make it pass.
 
@@ -160,7 +162,7 @@ powershell -NoProfile -File tests\Test-MigrateAgents.ps1
 
 It builds a throwaway profile and a unique sentinel-guarded folder under `%TEMP%`, maps two free drive letters to folders inside it with `subst`, and runs an unblocked copy of the script there. It covers the refusal paths for Copy, Verify, Activate and Cleanup, plus recovery from interrupted copy, activation and cleanup. The volumes are unmapped and the folder removed at the end; no existing drive root, `Q:\_admtest` path or agent data is touched. Exit code 0 means every check passed.
 
-### 6. Link shared skills (optional)
+### 7. Link shared skills (optional)
 
 `scripts\Link-SharedSkills.ps1` links the shared pool into each migrated agent's own skills directory. It reads `registry\migration-manifest.json`, confirms each legacy path is still a junction to its verified destination, and then **discovers** the agent's skills directory inside that destination (a directory named `skill` or `skills`, ignoring builtin, plugin, extension, staging and cache locations).
 
@@ -185,7 +187,7 @@ powershell -NoProfile -File tests\Test-LinkSharedSkills.ps1
 
 It builds a throwaway agents root and profile in a unique sentinel-guarded folder under `%TEMP%`, maps a free drive letter to that folder with `subst`, then runs the linker against them in child processes. It covers report-only, apply, idempotent re-apply, a forced junction failure, a partial run where earlier links are created before a later agent fails, and a same-agent partial failure that produces the `LINK FAILED (+N linked)` label. The temporary ACL deny rule, the volume mapping and the folder are removed at the end, and no existing drive root or `Q:\_admtest` path is touched; exit code 0 means every check passed.
 
-### 7. Cleanup (optional, destructive)
+### 8. Cleanup (optional, destructive)
 
 **Only after independent operational testing**, identify the exact hold directories proposed for deletion and explicitly approve them. Supply an existing backup root on an independent device; `R:` below is just an example:
 

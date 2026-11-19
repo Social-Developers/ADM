@@ -81,7 +81,9 @@ After the user has closed affected agents and the agent has verified they are st
 
 The script renames each original source directory to a sibling hold directory and creates a legacy junction to the verified the selected drive destination. It must never be invoked on live directories with active writes. If activation fails, stop and diagnose. Do not delete the hold directory manually.
 
-If an agent fails after activation, use Rollback rather than editing junctions or holds by hand:
+## Rollback (optional recovery)
+
+Use this instead of the normal sequence only when an agent fails after activation, and before Cleanup removes the hold. Never edit junctions or holds by hand:
 
 ```powershell
 & $scriptPath -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback
