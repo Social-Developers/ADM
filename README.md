@@ -14,6 +14,8 @@ A Windows PowerShell skill for consolidating supported AI coding-agent **user da
 - Keeps the original directory as a sibling `*.qagents-migration-hold` during validation.
 - Creates an inventory of private skills and a shared-skills directory.
 - Requires a separate, verified backup and explicit approval before deleting held originals.
+- Maintains a hash-verified snapshot history for accepted rollbacks, with a cluster-aware free-space preflight, lease-guarded staging, detection of interrupted restores, and adoption of orphaned snapshots.
+- Supports snapshot pruning and per-agent restore, plus Quick, JSON and strict Status reporting and a single-generation manifest backup.
 - Optionally links entries from the shared skills pool into each migrated agent's own skills directory, discovering that directory per agent and reporting any agent whose location cannot be confirmed.
 
 It does **not** move application executables, migrate project repositories or project-local rules, discover every custom installation, or automatically deduplicate and install skills across agents.
@@ -97,7 +99,7 @@ Before migration, the skill **asks which drive letter you want to use**. Enter a
 
 Open PowerShell in the extracted repository directory. Select a drive first, for example `$driveLetter = 'D'`, and use the same letter for all phases. These phases must be run **in order**. Each command should complete without an error before continuing.
 
-Activate, Rollback and Cleanup accept `-WhatIf`. A preview runs the same read-only validation but does not require their approval switches: `-ConfirmAgentsStopped` and `-ApproveRollback` are skipped for Rollback, `-ConfirmAgentsValidated` and `-ApproveDeletion` for Cleanup, and `-BackupRoot` is optional for a Cleanup preview. It reports what would be renamed, linked or deleted and changes no files or manifest state.
+Activate, Rollback, Cleanup, PruneSnapshots, AdoptSnapshots and RestoreSnapshot accept `-WhatIf`. A preview runs the same read-only validation but does not require their approval switches: `-ConfirmAgentsStopped` and `-ApproveRollback` are skipped for Rollback, `-ConfirmAgentsValidated` and `-ApproveDeletion` for Cleanup, `-ApproveSnapshotDeletion` for PruneSnapshots, `-ApproveSnapshotAdoption` for AdoptSnapshots, and `-ConfirmAgentsStopped`/`-ApproveSnapshotRestore` for RestoreSnapshot. `-BackupRoot` is optional for a Cleanup preview. It reports what would be renamed, linked, deleted, adopted or restored and changes no files or manifest state.
 
 ### 1. Inventory
 
@@ -149,9 +151,42 @@ Rollback requires `-ConfirmAgentsStopped` and `-ApproveRollback`. It verifies th
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Rollback -Agent claude -ConfirmAgentsStopped -ApproveRollback -AcceptDestinationChanges
 ```
 
-When the switch is used and the diff is non-empty, Rollback checks free space, copies the changed destination to a temporary `.incomplete-*` folder under `migration\rollbacks`, verifies that copy, and only then renames it to `<DRIVE>:\agents\migration\rollbacks\<agent>-<UTC timestamp>`. A failed copy is removed and aborts the rollback before any junction or hold changes; leftover staging from an interrupted attempt is cleared at the start of the next attempt, so a retry cannot add a partial folder or duplicate snapshot. The manifest records the path as `destinationSnapshot` plus a SHA-256 tree digest as `destinationSnapshotHash`. Each approved rollback gets its own folder. Snapshots are retained deliberately: the script never prunes them, and Cleanup does not remove them. Keep each snapshot until its contents have been reconciled or are no longer needed. `-WhatIf` never creates one.
+When the switch is used and the diff is non-empty, Rollback checks free space (rounding file sizes up to the destination volume's cluster size), copies the changed destination to a temporary `.incomplete-*` folder under `migration\rollbacks` while holding a `.snapshot-lease.json` lease, verifies that copy, and only then renames it to `<DRIVE>:\agents\migration\rollbacks\<agent>-<UTC timestamp>`. A failed copy is removed and aborts the rollback before any junction or hold changes; leftover staging from an interrupted attempt is cleared at the start of the next attempt, so a retry cannot add a partial folder or duplicate snapshot. A lease left by a hard crash is reported by Status; snapshot phases clear it only after confirming the owning process is gone.
+
+The manifest stores `destinationSnapshots` as records with `path`, `hash`, `bytes`, `createdUtc`, `digestVersion`, `pinned`, and the added/removed/changed counts, alongside the latest `destinationSnapshot`, `destinationSnapshotHash`, and `destinationSnapshotDigestVersion`. New snapshots use digest version 2, which includes directory layout; version-1 records remain readable. A sidecar `<snapshot>.snapshot.json` records the same metadata outside the tree. `-DeduplicateSnapshots` hard-links identical files to the previous snapshot when the filesystem supports it and otherwise keeps copies. Each approved rollback with a non-empty diff gets its own folder. Snapshots are retained deliberately: Cleanup does not remove them. Keep each snapshot until its contents have been reconciled or are no longer needed, then prune it explicitly. `-WhatIf` never creates one.
 
 Rollback renames the hold back, records the time, returns the entry to `Verified`, and leaves the destination in place either way. It cannot recover an agent whose Cleanup already completed, because the hold is gone by then.
+
+### 5a. Snapshot maintenance (optional)
+
+Snapshots are never pruned automatically. Use `PruneSnapshots` when a retained snapshot is no longer needed:
+
+```powershell
+.\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase PruneSnapshots -Agent claude -KeepLast 3 -WhatIf
+.\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase PruneSnapshots -Agent claude -KeepLast 3 -ApproveSnapshotDeletion
+```
+
+`-KeepLast N` and `-KeepDays N` select snapshots to retain; the current snapshot and any record marked `pinned` are always retained. Without `-WhatIf`, the phase requires `-ApproveSnapshotDeletion`. It renames each folder to `.deleting-*`, removes the record from the manifest, and then deletes it; a later prune clears a pending `.deleting-*` folder left by a crash. A missing record is removed without deleting anything outside `migration\rollbacks`.
+
+`AdoptSnapshots` backfills a legacy string-valued `destinationSnapshots` history and adopts orphaned final snapshot folders left by an interrupted rollback:
+
+```powershell
+.\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase AdoptSnapshots -Agent claude -WhatIf
+.\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase AdoptSnapshots -Agent claude -SnapshotPath 'D:\agents\migration\rollbacks\claude-20260101T000000000Z' -ApproveSnapshotAdoption
+```
+
+Without `-WhatIf`, adoption requires `-ApproveSnapshotAdoption`. It recomputes each adopted snapshot's digest, writes its sidecar, and appends it to history without changing the current `destinationSnapshot`. Use Status first; adopt only folders you recognize.
+
+`PruneSnapshots` and `AdoptSnapshots` acquire the same `.snapshot-lease.json` used by snapshot creation and restore. While one snapshot phase holds the lease, another snapshot phase is refused before it can change the manifest; the lease is released when the phase finishes or throws.
+
+`RestoreSnapshot` replaces one agent's current destination with a referenced snapshot:
+
+```powershell
+.\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase RestoreSnapshot -Agent claude -SnapshotPath 'D:\agents\migration\rollbacks\claude-20260101T000000000Z' -WhatIf
+.\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase RestoreSnapshot -Agent claude -SnapshotPath 'D:\agents\migration\rollbacks\claude-20260101T000000000Z' -ConfirmAgentsStopped -ApproveSnapshotRestore
+```
+
+Restore accepts only a snapshot referenced by the selected agent, verifies its recorded hash, and, unless `-WhatIf` is used, requires `-ConfirmAgentsStopped` and `-ApproveSnapshotRestore`. Before hashing or copying, it rejects any snapshot tree containing a junction or other reparse point. It first creates a safety snapshot of the current destination, copies the chosen snapshot to staging, renames the current destination aside, moves staging into place, and verifies the result. If the final move or verification fails, it attempts to put the previous destination back. If the process is killed after the destination rename, Status reports the missing destination, the stranded `<destination>.pre-restore-*` backup, and any `.restore-*` staging; the next RestoreSnapshot refuses until those artifacts are reconciled. Rename a stranded backup back to the destination when the destination is missing, review it before removing a backup when the destination is present, and remove incomplete `.restore-*` staging only after that review. Restore does not merge newer destination changes; inspect the safety snapshot and the diff before using it.
 
 ### 6. Test each agent
 
@@ -163,7 +198,9 @@ Check state:
 .\scripts\migrate-agents.ps1 -DriveLetter $driveLetter -Phase Status
 ```
 
-`Status` compares the manifest with disk. It reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, junctions that do not fit the recorded state, any recorded rollback snapshot that is missing, outside `migration\rollbacks`, lacks its hash, is unreadable, or no longer matches `destinationSnapshotHash`, and any orphaned `.incomplete-*` staging folder under `migration\rollbacks`. Reconcile any reported issue before the next phase; a clean run prints `Status: manifest matches disk for the selected agents.`
+`Status` compares the manifest with disk. It reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, junctions that do not fit the recorded state, any recorded snapshot that is missing, outside `migration\rollbacks`, has a bad path or duplicate entry, lacks its hash, is unreadable, or no longer matches its recorded digest, plus orphaned `.incomplete-*` staging, orphaned `.restore-*` staging, stranded `<destination>.pre-restore-*` backups, unreferenced final snapshot folders, pending `.deleting-*` folders, and active or stale snapshot leases. Issues carry stable codes for automation.
+
+Use `-Quick` to skip content hashing while retaining path, existence, state and lease checks; `-AsJson` to emit a machine-readable object with `schema`, `generatedUtc`, `root`, `healthy`, `issueCount`, `issues`, `entries` and `inventory`; and `-Strict` to exit with code 2 when any issue exists. Reconcile any reported issue before the next phase; a clean run prints `Status: manifest matches disk for the selected agents.`
 
 To exercise the migration phases without touching live agent data, run the scratch harness:
 
@@ -171,7 +208,7 @@ To exercise the migration phases without touching live agent data, run the scrat
 powershell -NoProfile -File tests\Test-MigrateAgents.ps1
 ```
 
-It builds a throwaway profile and a unique sentinel-guarded folder under `%TEMP%`, maps two free drive letters to folders inside it with `subst`, and runs an unblocked copy of the script there. It covers the refusal paths for Copy, Verify, Activate and Cleanup, plus recovery from interrupted copy, activation and cleanup. The volumes are unmapped and the folder removed at the end; no existing drive root, `Q:\_admtest` path or agent data is touched. Exit code 0 means every check passed.
+It builds a throwaway profile and a unique sentinel-guarded folder under `%TEMP%`, maps two free drive letters to folders inside it with `subst`, and runs an unblocked copy of the script there. It covers the refusal paths for Copy, Verify, Activate and Cleanup, recovery from interrupted copy, activation and cleanup, and the snapshot lifecycle: free-space preflight, digest versions, naming collisions, leases, locked staging, prune, legacy adoption, a fault-injected crash after the snapshot rename, a fault-injected crash after the restore destination rename, stranded-destination reconciliation, a tampered snapshot containing a junction, restore, deduplication, snapshot-phase lease contention, Status Quick/JSON/strict modes, and manifest backup recovery. The volumes are unmapped and the folder removed at the end; no existing drive root, `Q:\_admtest` path or agent data is touched. Exit code 0 means every check passed.
 
 ### 7. Link shared skills (optional)
 
@@ -223,6 +260,8 @@ To limit operations to one agent, add `-Agent claude` (or `codex`, `gemini`, `cu
 | Copy | Leaves source intact | Rejects collisions; verifies copied tree |
 | Verify | Leaves source intact | Compares hashes and layout |
 | Activate | Renames source to hold; creates junction | Requires stopped-agent confirmation and re-verification |
+| PruneSnapshots | Deletes unneeded snapshot copies | Keeps the current snapshot and pinned records; requires explicit approval; rename-before-delete |
+| RestoreSnapshot | **Replaces the current destination** | Requires stopped-agent confirmation and explicit approval; verifies the snapshot, records a safety snapshot, stages the copy and re-verifies |
 | Cleanup | **Deletes held original** | Requires explicit approval, operational-test assertion, verified backup and final comparison |
 
 If a step fails, **stop**. Do not manually delete hold directories, rerun Inventory over an existing manifest, or force-overwrite a destination. Investigate the manifest, source, hold directory, and junction before attempting recovery.
@@ -232,8 +271,11 @@ If a step fails, **stop**. Do not manually delete hold directories, rerun Invent
 - Only the five user-level discovery paths above are implemented. Project-specific configurations, custom paths, and additional agents are out of scope.
 - The shared-skills folder and `skills.json` inventory are created, and linking them into agents is opt-in through `Link-SharedSkills.ps1`. There is no automatic deduplication, compatibility conversion, or content rewriting, and an agent whose skills directory cannot be identified unambiguously is reported `UNCONFIRMED` instead of being linked.
 - Hash checks verify file contents, not every filesystem property (for example alternate data streams, ownership, all ACL semantics, or sparse-file details).
-- The script does not calculate free-space requirements, detect active processes, or perform agent startup tests automatically. The skill instructs the operator/agent to perform these checks separately.
-- The script has no general-purpose automated rollback command. Failed operations may require careful manual recovery.
+- The script preflights free space for a rollback snapshot using file sizes rounded to the destination volume's cluster size. It does not predict total migration space or guarantee headroom for other activity, detect active processes, or perform agent startup tests automatically. The skill instructs the operator/agent to perform these checks separately.
+- Snapshot deduplication is opt-in and uses NTFS hard links when available; it falls back to copies and does not deduplicate across filesystems.
+- Restore is per-agent and snapshot-specific. It creates a safety snapshot but does not merge newer destination changes, so review the safety snapshot before discarding it. An interrupted restore requires manual reconciliation; the next restore refuses while a stranded `.pre-restore-*` backup or incomplete `.restore-*` staging remains.
+- The manifest `.bak` is a single-generation backup for interrupted writes, not a long-term version history.
+- Rollback and RestoreSnapshot recover one selected agent at a time. There is no automatic multi-agent disaster recovery, and RestoreSnapshot does not merge newer destination changes.
 - The script rejects source trees containing reparse points and does not automatically resolve file changes made during or after migration.
 - Do not treat `-ConfirmAgentsValidated` or `-ApproveDeletion` as proof that a test was performed; they are explicit operator assertions.
 
