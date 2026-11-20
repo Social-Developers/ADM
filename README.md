@@ -177,7 +177,7 @@ Snapshots are never pruned automatically. Use `PruneSnapshots` when a retained s
 
 Without `-WhatIf`, adoption requires `-ApproveSnapshotAdoption`. It recomputes each adopted snapshot's digest, writes its sidecar, and appends it to history without changing the current `destinationSnapshot`. Use Status first; adopt only folders you recognize.
 
-`PruneSnapshots` and `AdoptSnapshots` acquire the same `.snapshot-lease.json` used by snapshot creation and restore. While one snapshot phase holds the lease, another snapshot phase is refused before it can change the manifest; the lease is released when the phase finishes or throws.
+`PruneSnapshots` and `AdoptSnapshots` acquire the same `.snapshot-lease.json` used by snapshot creation and restore. While one snapshot phase holds the lease, another snapshot phase is refused before it can change the manifest; the lease is released when the phase finishes or throws. Each phase reloads the manifest after acquiring the lease, so a phase that started earlier cannot overwrite records written by the one that finished first.
 
 `RestoreSnapshot` replaces one agent's current destination with a referenced snapshot:
 
@@ -208,7 +208,7 @@ To exercise the migration phases without touching live agent data, run the scrat
 powershell -NoProfile -File tests\Test-MigrateAgents.ps1
 ```
 
-It builds a throwaway profile and a unique sentinel-guarded folder under `%TEMP%`, maps two free drive letters to folders inside it with `subst`, and runs an unblocked copy of the script there. It covers the refusal paths for Copy, Verify, Activate and Cleanup, recovery from interrupted copy, activation and cleanup, and the snapshot lifecycle: free-space preflight, digest versions, naming collisions, leases, locked staging, prune, legacy adoption, a fault-injected crash after the snapshot rename, a fault-injected crash after the restore destination rename, stranded-destination reconciliation, a tampered snapshot containing a junction, restore, deduplication, snapshot-phase and rollback/restore manifest-window lease contention, Status Quick/JSON/strict modes, and manifest backup recovery. The volumes are unmapped and the folder removed at the end; no existing drive root, `Q:\_admtest` path or agent data is touched. Exit code 0 means every check passed.
+It builds a throwaway profile and a unique sentinel-guarded folder under `%TEMP%`, maps two free drive letters to folders inside it with `subst`, and runs an unblocked copy of the script there. It covers the refusal paths for Copy, Verify, Activate and Cleanup, recovery from interrupted copy, activation and cleanup, and the snapshot lifecycle: free-space preflight, digest versions, naming collisions, leases, locked staging, prune, legacy adoption, a fault-injected crash after the snapshot rename, a fault-injected crash after the restore destination rename, stranded-destination reconciliation, a tampered snapshot containing a junction, restore, deduplication, snapshot-phase and rollback/restore manifest-window lease contention, stale-manifest reload after a phase completes, Status Quick/JSON/strict modes, and manifest backup recovery. The volumes are unmapped and the folder removed at the end; no existing drive root, `Q:\_admtest` path or agent data is touched. Exit code 0 means every check passed.
 
 ### 7. Link shared skills (optional)
 

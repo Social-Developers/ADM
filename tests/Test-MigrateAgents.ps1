@@ -591,6 +591,41 @@ try {
     $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
     Check ((Read-Entry 'claude').state -eq 'Activated') 'claude can be activated after the dedupe rollback'
 
+    # A phase paused after loading the manifest must reload it before writing.
+    $staleAdoption = Join-Path $rollbacksRoot 'claude-20260101T000001000Z'
+    Add-File (Join-Path $staleAdoption 'adopted.txt') 'adopted'
+    Set-Content -LiteralPath $claudeSettings -Value '{"theme":"stale-window"}'
+    $staleMarker = Join-Path $rollbacksRoot '.test-before-lease'
+    $staleRollback = Start-Migrate -Arguments @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-AcceptDestinationChanges', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'BeforeSnapshotLease' }
+    $markerAppeared = Wait-ForFile $staleMarker 30
+    Check $markerAppeared 'rollback pauses after loading the manifest'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $staleAdoption, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Adopted snapshot' 'adoption completes while the rollback is paused'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $staleAdoption }).Count -eq 1) 'adoption is recorded before the paused rollback resumes'
+    Set-Content -LiteralPath ($staleMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $staleRollback
+    $afterStale = Read-Entry 'claude'
+    Check ($afterStale.state -eq 'Verified') 'paused rollback completes after adopting'
+    Check (@($afterStale.destinationSnapshots | Where-Object { $_.path -eq $staleAdoption }).Count -eq 1) 'rollback reload preserves the newer adoption'
+    Set-Content -LiteralPath $claudeSettings -Value '{"theme":"dark"}'
+    $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
+    Check ((Read-Entry 'claude').state -eq 'Activated') 'claude reactivates after the stale-manifest regression'
+
+    # Adoption must reload after its lease, preserving a prune that completed first.
+    $staleAdoption2 = Join-Path $rollbacksRoot 'claude-20260101T000002000Z'
+    Add-File (Join-Path $staleAdoption2 'adopted-2.txt') 'adopted-2'
+    $adoptWindow = Start-Migrate -Arguments @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $staleAdoption2, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'BeforeSnapshotLease' }
+    $markerAppeared = Wait-ForFile $staleMarker 30
+    Check $markerAppeared 'adoption pauses after loading the manifest'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+    Check ((Read-Entry 'claude').destinationSnapshots.Count -eq 1) 'prune completes while adoption is paused'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $staleAdoption }).Count -eq 0) 'prune removes the earlier adopted snapshot'
+    Set-Content -LiteralPath ($staleMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $adoptWindow
+    $afterAdoptReload = Read-Entry 'claude'
+    Check (@($afterAdoptReload.destinationSnapshots | Where-Object { $_.path -eq $staleAdoption }).Count -eq 0) 'adoption reload preserves the newer prune'
+    Check (@($afterAdoptReload.destinationSnapshots | Where-Object { $_.path -eq $staleAdoption2 }).Count -eq 1) 'adoption reload records the new snapshot'
+
     # Only a junction known to point at this destination may be removed.
     [IO.Directory]::Delete($claudeSource)
     $decoy = Join-Path $root 'agents\decoy'

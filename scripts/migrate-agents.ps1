@@ -121,6 +121,12 @@ function Load-Json([string]$Path) {
         throw
     }
 }
+function Reload-Manifest {
+    $loaded = Load-Json $script:ManifestPath
+    Assert-Condition ($loaded.schema -eq 1) 'Unsupported manifest schema.'
+    Assert-Condition ((FullPath $loaded.root) -ieq $script:Root) 'Root differs from manifest.'
+    return $loaded
+}
 function FileHash([string]$Path) {
     # Hashed directly so -WhatIf cannot suppress the read the way it does for Get-FileHash.
     $sha = [Security.Cryptography.SHA256]::Create()
@@ -442,6 +448,7 @@ function Assert-NoActiveSnapshotLease([string]$Rollbacks) {
 }
 function Enter-SnapshotLease([string]$Rollbacks, [string]$Agent, [string]$Staging, [string]$Snapshot) {
     New-Item -ItemType Directory -Path $Rollbacks -Force | Out-Null
+    Wait-SnapshotFailpoint 'BeforeSnapshotLease' (Join-Path $Rollbacks '.test-before-lease')
     $path = Get-SnapshotLeasePath $Rollbacks
     $lease = [pscustomobject]@{
         pid = $PID; host = [Environment]::MachineName; agent = $Agent; startedUtc = [DateTime]::UtcNow.ToString('o')
@@ -510,13 +517,12 @@ function Invoke-SnapshotDedupe([string]$Snapshot, [string]$Previous) {
         }
     }
 }
-function New-DestinationSnapshot([object]$E, [string]$Rollbacks, [object]$Changes, [switch]$LeaseHeld) {
+function New-DestinationSnapshot([object]$E, [string]$Rollbacks, [object]$Changes) {
+    # The caller holds the snapshot lease for the entire phase.
     New-Item -ItemType Directory -Path $Rollbacks -Force | Out-Null
     $timestamp = [DateTime]::UtcNow
     $snapshot = Resolve-SnapshotPath $Rollbacks $E.id $timestamp
     $staging = Join-Path $Rollbacks ('.incomplete-' + $E.id + '-' + [guid]::NewGuid().ToString('N'))
-    $ownsLease = -not $LeaseHeld
-    if ($ownsLease) { $lease = Enter-SnapshotLease $Rollbacks $E.id $staging $snapshot }
     $snapshotCreated = $false
     try {
         foreach ($stale in @(Get-ChildItem -LiteralPath $Rollbacks -Directory -Force -Filter '.incomplete-*')) {
@@ -546,8 +552,6 @@ function New-DestinationSnapshot([object]$E, [string]$Rollbacks, [object]$Change
         if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
         if ($snapshotCreated -and (Test-Path -LiteralPath $snapshot)) { Remove-Item -LiteralPath $snapshot -Recurse -Force -ErrorAction SilentlyContinue }
         throw
-    } finally {
-        if ($ownsLease) { Remove-OwnSnapshotLease $Rollbacks }
     }
 }
 function Ensure-LatestSnapshotRecord([object]$E) {
@@ -686,9 +690,7 @@ if ($Phase -eq 'Inventory') {
     Write-Host "Inventory saved: $script:ManifestPath"
     exit 0
 }
-$manifest = Load-Json $script:ManifestPath
-Assert-Condition ($manifest.schema -eq 1) 'Unsupported manifest schema.'
-Assert-Condition ((FullPath $manifest.root) -ieq $script:Root) 'Root differs from manifest.'
+$manifest = Reload-Manifest
 $entries = @(Selected $manifest)
 Assert-Condition ($entries.Count -gt 0) 'No matching agents in manifest.'
 
@@ -882,11 +884,14 @@ switch ($Phase) {
         $rollbacks = Join-Path $script:Root 'migration\rollbacks'
         $leaseHeld = $false
         if (-not $WhatIfPreference) {
-            New-Item -ItemType Directory -Path $rollbacks -Force | Out-Null
             $lease = Enter-SnapshotLease $rollbacks $Agent '' ''
             $leaseHeld = $true
         }
         try {
+        if ($leaseHeld) {
+            $manifest = Reload-Manifest
+            $entries = @(Selected $manifest)
+        }
         foreach ($e in $entries) {
             Assert-Condition ($e.state -in @('Activated','BackupVerified')) "Cannot roll back $($e.id) in state $($e.state)"
             Assert-Condition (Test-Path -LiteralPath $e.hold -PathType Container) "Hold missing: $($e.hold)"
@@ -908,7 +913,7 @@ switch ($Phase) {
                 else { Write-Warning "Destination changed since activation; keeping the changed destination at $($e.destination)." }
             }
             if ($diffCount -gt 0 -and $AcceptDestinationChanges -and -not $WhatIfPreference) {
-                try { $record = New-DestinationSnapshot $e $rollbacks $diff -LeaseHeld }
+                try { $record = New-DestinationSnapshot $e $rollbacks $diff }
                 catch { throw "Snapshot copy failed for $($e.id); no snapshot retained. $($_.Exception.Message)" }
                 # The destination must not change while the snapshot is being copied.
                 $after = Get-TreeDiff $e.hold $e.destination
@@ -1023,6 +1028,10 @@ switch ($Phase) {
             $leaseHeld = $true
         }
         try {
+        if ($leaseHeld) {
+            $manifest = Reload-Manifest
+            $entries = @(Selected $manifest)
+        }
         if (-not $WhatIfPreference) {
             foreach ($pending in @(Get-ChildItem -LiteralPath $rollbacks -Directory -Force -Filter '.deleting-*')) {
                 Remove-Item -LiteralPath $pending.FullName -Recurse -Force -ErrorAction SilentlyContinue
@@ -1097,6 +1106,10 @@ switch ($Phase) {
             $leaseHeld = $true
         }
         try {
+        if ($leaseHeld) {
+            $manifest = Reload-Manifest
+            $entries = @(Selected $manifest)
+        }
         $changed = $false
         if (-not $WhatIfPreference) {
             foreach ($e in $entries) { if (Ensure-LatestSnapshotRecord $e) { $changed = $true } }
@@ -1164,64 +1177,70 @@ switch ($Phase) {
         $rollbacks = Join-Path $script:Root 'migration\rollbacks'
         Assert-Condition (Test-Path -LiteralPath $rollbacks -PathType Container) 'No rollbacks folder.'
         Assert-NoActiveSnapshotLease $rollbacks
-        $e = $entries[0]
-        Assert-Condition ($e.state -in @('Activated', 'BackupVerified')) "Cannot restore snapshot for $($e.id) in state $($e.state)"
-        $destinationParent = Split-Path $e.destination -Parent
-        $destinationLeaf = Split-Path $e.destination -Leaf
-        $strandedBackups = @()
-        if (Test-Path -LiteralPath $destinationParent -PathType Container) {
-            $strandedBackups = @(Get-ChildItem -LiteralPath $destinationParent -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like ($destinationLeaf + '.pre-restore-*') })
-        }
-        $staleRestoreStaging = @(Get-ChildItem -LiteralPath $rollbacks -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like ('.restore-' + $e.id + '-*') })
-        if ($strandedBackups.Count -gt 0) { throw "Previous restore left a stranded pre-restore destination; reconcile it before restoring: $($strandedBackups.FullName -join ', ')" }
-        if ($staleRestoreStaging.Count -gt 0) { throw "Previous restore left incomplete staging; reconcile it before restoring: $($staleRestoreStaging.FullName -join ', ')" }
-        Assert-Condition (Test-Path -LiteralPath $e.destination -PathType Container) "Destination missing; reconcile it before restoring: $($e.destination)"
-        $target = FullPath $SnapshotPath
-        Assert-Condition (Test-Path -LiteralPath $target -PathType Container) "Snapshot not found: $target"
-        $rollbacksFull = FullPath $rollbacks
-        Assert-Condition ($target -ine $rollbacksFull -and (IsWithin $target $rollbacksFull)) 'Snapshot must be under migration\rollbacks.'
-        $pathKey = $target.ToLowerInvariant()
-        $referencedKeys = @{}
-        foreach ($referencePath in @(Get-SnapshotReferencePaths $e)) {
-            if ([string]::IsNullOrWhiteSpace([string]$referencePath)) { continue }
-            try { $referencedKeys[(FullPath ([string]$referencePath)).ToLowerInvariant()] = $true } catch { }
-        }
-        Assert-Condition ($referencedKeys.ContainsKey($pathKey)) 'Snapshot is not referenced by this agent; adopt it first.'
-        Assert-TreeSafe $target
-        $expectedHash = $null
-        $version = 2
-        $latestProperty = $e.PSObject.Properties['destinationSnapshot']
-        $latestKey = $null
-        if ($null -ne $latestProperty -and -not [string]::IsNullOrWhiteSpace([string]$latestProperty.Value)) {
-            try { $latestKey = (FullPath ([string]$latestProperty.Value)).ToLowerInvariant() } catch { }
-        }
-        if ($null -ne $latestKey -and $latestKey -eq $pathKey) {
-            $hashProperty = $e.PSObject.Properties['destinationSnapshotHash']
-            if ($null -ne $hashProperty) { $expectedHash = [string]$hashProperty.Value }
-            $versionProperty = $e.PSObject.Properties['destinationSnapshotDigestVersion']
-            if ($null -ne $versionProperty) { $version = [int]$versionProperty.Value }
-        } else {
-            foreach ($record in @(Get-SnapshotRecords $e)) {
-                $raw = Get-SnapshotRecordPath $record
-                if ([string]::IsNullOrWhiteSpace([string]$raw)) { continue }
-                try { if ((FullPath ([string]$raw)) -ieq $target) { $expectedHash = Get-SnapshotRecordHash $record; $version = Get-SnapshotRecordVersion $record; break } } catch { }
-            }
-        }
-        Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$expectedHash)) 'Snapshot has no recorded hash; adopt or repair it first.'
-        $actual = Get-TreeDigest $target $version
-        Assert-Condition ($actual -eq ([string]$expectedHash).ToLowerInvariant()) 'Snapshot hash does not match; refusing restore.'
         if (-not $WhatIfPreference) {
             Assert-Condition $ConfirmAgentsStopped 'Close affected agents and pass -ConfirmAgentsStopped.'
             Assert-Condition $ApproveSnapshotRestore 'Explicit -ApproveSnapshotRestore is required.'
-        } else {
-            [void]$PSCmdlet.ShouldProcess($e.destination, "Restore $target")
-            Write-Host "would restore: $target -> $($e.destination)"
-            break
         }
-        $lease = Enter-SnapshotLease $rollbacks $e.id '' ''
+        $leaseHeld = -not $WhatIfPreference
+        if ($leaseHeld) { $lease = Enter-SnapshotLease $rollbacks $Agent '' '' }
         try {
+            if ($leaseHeld) {
+                $manifest = Reload-Manifest
+                $entries = @(Selected $manifest)
+            }
+            $e = $entries[0]
+            Assert-Condition ($e.state -in @('Activated', 'BackupVerified')) "Cannot restore snapshot for $($e.id) in state $($e.state)"
+            $destinationParent = Split-Path $e.destination -Parent
+            $destinationLeaf = Split-Path $e.destination -Leaf
+            $strandedBackups = @()
+            if (Test-Path -LiteralPath $destinationParent -PathType Container) {
+                $strandedBackups = @(Get-ChildItem -LiteralPath $destinationParent -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like ($destinationLeaf + '.pre-restore-*') })
+            }
+            $staleRestoreStaging = @(Get-ChildItem -LiteralPath $rollbacks -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like ('.restore-' + $e.id + '-*') })
+            if ($strandedBackups.Count -gt 0) { throw "Previous restore left a stranded pre-restore destination; reconcile it before restoring: $($strandedBackups.FullName -join ', ')" }
+            if ($staleRestoreStaging.Count -gt 0) { throw "Previous restore left incomplete staging; reconcile it before restoring: $($staleRestoreStaging.FullName -join ', ')" }
+            Assert-Condition (Test-Path -LiteralPath $e.destination -PathType Container) "Destination missing; reconcile it before restoring: $($e.destination)"
+            $target = FullPath $SnapshotPath
+            Assert-Condition (Test-Path -LiteralPath $target -PathType Container) "Snapshot not found: $target"
+            $rollbacksFull = FullPath $rollbacks
+            Assert-Condition ($target -ine $rollbacksFull -and (IsWithin $target $rollbacksFull)) 'Snapshot must be under migration\rollbacks.'
+            $pathKey = $target.ToLowerInvariant()
+            $referencedKeys = @{}
+            foreach ($referencePath in @(Get-SnapshotReferencePaths $e)) {
+                if ([string]::IsNullOrWhiteSpace([string]$referencePath)) { continue }
+                try { $referencedKeys[(FullPath ([string]$referencePath)).ToLowerInvariant()] = $true } catch { }
+            }
+            Assert-Condition ($referencedKeys.ContainsKey($pathKey)) 'Snapshot is not referenced by this agent; adopt it first.'
+            Assert-TreeSafe $target
+            $expectedHash = $null
+            $version = 2
+            $latestProperty = $e.PSObject.Properties['destinationSnapshot']
+            $latestKey = $null
+            if ($null -ne $latestProperty -and -not [string]::IsNullOrWhiteSpace([string]$latestProperty.Value)) {
+                try { $latestKey = (FullPath ([string]$latestProperty.Value)).ToLowerInvariant() } catch { }
+            }
+            if ($null -ne $latestKey -and $latestKey -eq $pathKey) {
+                $hashProperty = $e.PSObject.Properties['destinationSnapshotHash']
+                if ($null -ne $hashProperty) { $expectedHash = [string]$hashProperty.Value }
+                $versionProperty = $e.PSObject.Properties['destinationSnapshotDigestVersion']
+                if ($null -ne $versionProperty) { $version = [int]$versionProperty.Value }
+            } else {
+                foreach ($record in @(Get-SnapshotRecords $e)) {
+                    $raw = Get-SnapshotRecordPath $record
+                    if ([string]::IsNullOrWhiteSpace([string]$raw)) { continue }
+                    try { if ((FullPath ([string]$raw)) -ieq $target) { $expectedHash = Get-SnapshotRecordHash $record; $version = Get-SnapshotRecordVersion $record; break } } catch { }
+                }
+            }
+            Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$expectedHash)) 'Snapshot has no recorded hash; adopt or repair it first.'
+            $actual = Get-TreeDigest $target $version
+            Assert-Condition ($actual -eq ([string]$expectedHash).ToLowerInvariant()) 'Snapshot hash does not match; refusing restore.'
+            if ($WhatIfPreference) {
+                [void]$PSCmdlet.ShouldProcess($e.destination, "Restore $target")
+                Write-Host "would restore: $target -> $($e.destination)"
+                break
+            }
             $diff = Get-TreeDiff $e.hold $e.destination
-            $safety = New-DestinationSnapshot $e $rollbacks $diff -LeaseHeld
+            $safety = New-DestinationSnapshot $e $rollbacks $diff
             Wait-SnapshotFailpoint 'RestoreBeforeSafetyManifest' (Join-Path $rollbacks '.test-restore-ready')
             Add-SnapshotRecord $e $safety
             Save-Json $manifest $script:ManifestPath -Backup
@@ -1246,7 +1265,7 @@ switch ($Phase) {
                 if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
             }
         } finally {
-            Remove-OwnSnapshotLease $rollbacks
+            if ($leaseHeld) { Remove-OwnSnapshotLease $rollbacks }
         }
         break
     }
