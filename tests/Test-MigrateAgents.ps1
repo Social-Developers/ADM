@@ -626,6 +626,27 @@ try {
     Check (@($afterAdoptReload.destinationSnapshots | Where-Object { $_.path -eq $staleAdoption }).Count -eq 0) 'adoption reload preserves the newer prune'
     Check (@($afterAdoptReload.destinationSnapshots | Where-Object { $_.path -eq $staleAdoption2 }).Count -eq 1) 'adoption reload records the new snapshot'
 
+    # Prune must reload after its lease, preserving an adoption that completed first.
+    $stalePruneOlder = Join-Path $rollbacksRoot 'claude-20260101T000004000Z'
+    Add-File (Join-Path $stalePruneOlder 'older.txt') 'older'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $stalePruneOlder, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Adopted snapshot' 'older snapshot is adopted before the prune window'
+    $stalePruneAdoption = Join-Path $rollbacksRoot 'claude-20260101T000005000Z'
+    Add-File (Join-Path $stalePruneAdoption 'adopted-3.txt') 'adopted-3'
+    $pruneWindow = Start-Migrate -Arguments @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'BeforeSnapshotLease' }
+    $markerAppeared = Wait-ForFile $staleMarker 30
+    Check $markerAppeared 'prune pauses after loading the manifest'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $stalePruneAdoption, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Adopted snapshot' 'adoption completes while the prune is paused'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $stalePruneAdoption }).Count -eq 1) 'adoption is recorded before the paused prune resumes'
+    Set-Content -LiteralPath ($staleMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $pruneWindow
+    $afterPruneReload = Read-Entry 'claude'
+    Check (@($afterPruneReload.destinationSnapshots | Where-Object { $_.path -eq $stalePruneAdoption }).Count -eq 1) 'prune reload preserves the newer adoption'
+    Check (@($afterPruneReload.destinationSnapshots | Where-Object { $_.path -eq $staleAdoption2 }).Count -eq 0) 'prune reload removes the record pruned from its new history'
+    Check (@($afterPruneReload.destinationSnapshots | Where-Object { $_.path -eq $stalePruneOlder }).Count -eq 0) 'prune reload applies KeepLast to the newer history'
+    Check (-not (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json'))) 'prune releases its lease after the stale-manifest window'
+
     # Only a junction known to point at this destination may be removed.
     [IO.Directory]::Delete($claudeSource)
     $decoy = Join-Path $root 'agents\decoy'
