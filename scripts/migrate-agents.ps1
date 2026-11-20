@@ -76,6 +76,15 @@ function Assert-TreeSafe([string]$Path) {
         }
     }
 }
+function Wait-SnapshotFailpoint([string]$Failpoint, [string]$Marker) {
+    if ($env:ADM_TEST_FAILPOINT -ne $Failpoint) { return }
+    Set-Content -LiteralPath $Marker -Value 'ready'
+    $release = $Marker + '.release'
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (-not (Test-Path -LiteralPath $release) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+    Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $release -Force -ErrorAction SilentlyContinue
+}
 function Save-Json([object]$Object, [string]$Path, [switch]$Backup) {
     $tmp = "$Path.tmp.$PID"
     $json = ConvertTo-Json -InputObject $Object -Depth 20
@@ -479,12 +488,13 @@ function Invoke-SnapshotDedupe([string]$Snapshot, [string]$Previous) {
         }
     }
 }
-function New-DestinationSnapshot([object]$E, [string]$Rollbacks, [object]$Changes) {
+function New-DestinationSnapshot([object]$E, [string]$Rollbacks, [object]$Changes, [switch]$LeaseHeld) {
     New-Item -ItemType Directory -Path $Rollbacks -Force | Out-Null
     $timestamp = [DateTime]::UtcNow
     $snapshot = Resolve-SnapshotPath $Rollbacks $E.id $timestamp
     $staging = Join-Path $Rollbacks ('.incomplete-' + $E.id + '-' + [guid]::NewGuid().ToString('N'))
-    $lease = Enter-SnapshotLease $Rollbacks $E.id $staging $snapshot
+    $ownsLease = -not $LeaseHeld
+    if ($ownsLease) { $lease = Enter-SnapshotLease $Rollbacks $E.id $staging $snapshot }
     $snapshotCreated = $false
     try {
         foreach ($stale in @(Get-ChildItem -LiteralPath $Rollbacks -Directory -Force -Filter '.incomplete-*')) {
@@ -515,7 +525,7 @@ function New-DestinationSnapshot([object]$E, [string]$Rollbacks, [object]$Change
         if ($snapshotCreated -and (Test-Path -LiteralPath $snapshot)) { Remove-Item -LiteralPath $snapshot -Recurse -Force -ErrorAction SilentlyContinue }
         throw
     } finally {
-        Remove-OwnSnapshotLease $Rollbacks
+        if ($ownsLease) { Remove-OwnSnapshotLease $Rollbacks }
     }
 }
 function Ensure-LatestSnapshotRecord([object]$E) {
@@ -847,6 +857,14 @@ switch ($Phase) {
             Assert-Condition $ConfirmAgentsStopped 'Close affected agents and pass -ConfirmAgentsStopped.'
             Assert-Condition $ApproveRollback 'Explicit -ApproveRollback is required.'
         }
+        $rollbacks = Join-Path $script:Root 'migration\rollbacks'
+        $leaseHeld = $false
+        if (-not $WhatIfPreference) {
+            New-Item -ItemType Directory -Path $rollbacks -Force | Out-Null
+            $lease = Enter-SnapshotLease $rollbacks $Agent '' ''
+            $leaseHeld = $true
+        }
+        try {
         foreach ($e in $entries) {
             Assert-Condition ($e.state -in @('Activated','BackupVerified')) "Cannot roll back $($e.id) in state $($e.state)"
             Assert-Condition (Test-Path -LiteralPath $e.hold -PathType Container) "Hold missing: $($e.hold)"
@@ -868,9 +886,7 @@ switch ($Phase) {
                 else { Write-Warning "Destination changed since activation; keeping the changed destination at $($e.destination)." }
             }
             if ($diffCount -gt 0 -and $AcceptDestinationChanges -and -not $WhatIfPreference) {
-                $rollbacks = Join-Path $script:Root 'migration\rollbacks'
-                New-Item -ItemType Directory -Path $rollbacks -Force | Out-Null
-                try { $record = New-DestinationSnapshot $e $rollbacks $diff }
+                try { $record = New-DestinationSnapshot $e $rollbacks $diff -LeaseHeld }
                 catch { throw "Snapshot copy failed for $($e.id); no snapshot retained. $($_.Exception.Message)" }
                 # The destination must not change while the snapshot is being copied.
                 $after = Get-TreeDiff $e.hold $e.destination
@@ -882,6 +898,7 @@ switch ($Phase) {
                     if (Test-Path -LiteralPath $sidecar) { Remove-Item -LiteralPath $sidecar -Force -ErrorAction SilentlyContinue }
                     throw "Destination changed while snapshotting $($e.id); refusing rollback."
                 }
+                Wait-SnapshotFailpoint 'RollbackBeforeManifest' (Join-Path $rollbacks '.test-rollback-ready')
                 Add-SnapshotRecord $e $record
                 Write-Host "Destination snapshot: $($record.path)"
             }
@@ -912,6 +929,9 @@ switch ($Phase) {
                 }) -Force
             Update-State $manifest $e 'Verified'
             Write-Host "Rolled back $($e.id): $($e.source) (destination left at $($e.destination))"
+        }
+        } finally {
+            if ($leaseHeld) { Remove-OwnSnapshotLease $rollbacks }
         }
         break
     }
@@ -1176,30 +1196,34 @@ switch ($Phase) {
             Write-Host "would restore: $target -> $($e.destination)"
             break
         }
-        $diff = Get-TreeDiff $e.hold $e.destination
-        $safety = New-DestinationSnapshot $e $rollbacks $diff
-        Add-SnapshotRecord $e $safety
-        Save-Json $manifest $script:ManifestPath -Backup
-        Assert-SnapshotSpace $target $rollbacks
-        $staging = Join-Path $rollbacks ('.restore-' + $e.id + '-' + [guid]::NewGuid().ToString('N'))
-        $backupDest = $e.destination + '.pre-restore-' + [guid]::NewGuid().ToString('N')
-        $lease = Enter-SnapshotLease $rollbacks $e.id $staging $target
+        $lease = Enter-SnapshotLease $rollbacks $e.id '' ''
         try {
-            Copy-Tree $target $staging
-            Rename-Item -LiteralPath $e.destination -NewName (Split-Path $backupDest -Leaf) -ErrorAction Stop
-            if ($env:ADM_TEST_FAILPOINT -eq 'AfterDestinationRename') { [Environment]::Exit(98) }
+            $diff = Get-TreeDiff $e.hold $e.destination
+            $safety = New-DestinationSnapshot $e $rollbacks $diff -LeaseHeld
+            Wait-SnapshotFailpoint 'RestoreBeforeSafetyManifest' (Join-Path $rollbacks '.test-restore-ready')
+            Add-SnapshotRecord $e $safety
+            Save-Json $manifest $script:ManifestPath -Backup
+            Assert-SnapshotSpace $target $rollbacks
+            $staging = Join-Path $rollbacks ('.restore-' + $e.id + '-' + [guid]::NewGuid().ToString('N'))
+            $backupDest = $e.destination + '.pre-restore-' + [guid]::NewGuid().ToString('N')
             try {
-                Move-Item -LiteralPath $staging -Destination $e.destination -ErrorAction Stop
-                Assert-EqualTrees $target $e.destination
-            } catch {
-                if (Test-Path -LiteralPath $e.destination) { Remove-Item -LiteralPath $e.destination -Recurse -Force -ErrorAction SilentlyContinue }
-                if (Test-Path -LiteralPath $backupDest) { Rename-Item -LiteralPath $backupDest -NewName (Split-Path $e.destination -Leaf) -ErrorAction Stop }
-                throw
+                Copy-Tree $target $staging
+                Rename-Item -LiteralPath $e.destination -NewName (Split-Path $backupDest -Leaf) -ErrorAction Stop
+                if ($env:ADM_TEST_FAILPOINT -eq 'AfterDestinationRename') { [Environment]::Exit(98) }
+                try {
+                    Move-Item -LiteralPath $staging -Destination $e.destination -ErrorAction Stop
+                    Assert-EqualTrees $target $e.destination
+                } catch {
+                    if (Test-Path -LiteralPath $e.destination) { Remove-Item -LiteralPath $e.destination -Recurse -Force -ErrorAction SilentlyContinue }
+                    if (Test-Path -LiteralPath $backupDest) { Rename-Item -LiteralPath $backupDest -NewName (Split-Path $e.destination -Leaf) -ErrorAction Stop }
+                    throw
+                }
+                if (Test-Path -LiteralPath $backupDest) { Remove-Item -LiteralPath $backupDest -Recurse -Force -ErrorAction SilentlyContinue }
+                Write-Host "Restored snapshot: $target -> $($e.destination)"
+            } finally {
+                if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
             }
-            if (Test-Path -LiteralPath $backupDest) { Remove-Item -LiteralPath $backupDest -Recurse -Force -ErrorAction SilentlyContinue }
-            Write-Host "Restored snapshot: $target -> $($e.destination)"
         } finally {
-            if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
             Remove-OwnSnapshotLease $rollbacks
         }
         break
