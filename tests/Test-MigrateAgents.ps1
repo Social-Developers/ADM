@@ -44,8 +44,13 @@ function Add-File([string]$Path, [string]$Text) {
     New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
     Set-Content -LiteralPath $Path -Value $Text
 }
-function Invoke-Migrate {
-    param([string[]]$Arguments, [switch]$ExpectFailure, [string]$UseScript = '', [int]$TimeoutSeconds = 180, [int]$ExpectedExitCode = -999)
+function Wait-ForFile([string]$Path, [int]$TimeoutSeconds = 30) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while (-not (Test-Path -LiteralPath $Path) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+    return (Test-Path -LiteralPath $Path)
+}
+function Start-Migrate {
+    param([string[]]$Arguments, [string]$UseScript = '', [hashtable]$Environment = @{})
     if ([string]::IsNullOrWhiteSpace($UseScript)) { $UseScript = $scriptPath }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'powershell.exe'
@@ -58,24 +63,37 @@ function Invoke-Migrate {
         if ($arg -match '[\s"]') { $quoted += ('"' + ($arg -replace '"', '\"') + '"') } else { $quoted += $arg }
     }
     $psi.Arguments = ($quoted -join ' ')
+    foreach ($key in @($Environment.Keys)) { $psi.EnvironmentVariables[$key] = [string]$Environment[$key] }
     $process = [System.Diagnostics.Process]::Start($psi)
-    $stdout = $process.StandardOutput.ReadToEndAsync()
-    $stderr = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        try { $process.Kill() } catch { }
-        try { & taskkill.exe /T /F /PID $process.Id 2>&1 | Out-Null } catch { }
-        throw "Migration command timed out after $TimeoutSeconds seconds: $($Arguments -join ' ')"
+    return [pscustomobject]@{
+        Process = $process
+        Stdout = $process.StandardOutput.ReadToEndAsync()
+        Stderr = $process.StandardError.ReadToEndAsync()
+        Arguments = @($Arguments)
     }
-    $code = $process.ExitCode
-    $text = ($stdout.Result + "`n" + $stderr.Result)
+}
+function Complete-Migrate {
+    param([object]$Handle, [switch]$ExpectFailure, [int]$TimeoutSeconds = 180, [int]$ExpectedExitCode = -999)
+    if (-not $Handle.Process.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $Handle.Process.Kill() } catch { }
+        try { & taskkill.exe /T /F /PID $Handle.Process.Id 2>&1 | Out-Null } catch { }
+        throw "Migration command timed out after $TimeoutSeconds seconds: $($Handle.Arguments -join ' ')"
+    }
+    $code = $Handle.Process.ExitCode
+    $text = ($Handle.Stdout.Result + "`n" + $Handle.Stderr.Result)
     if ($ExpectFailure) {
-        Check ($code -ne 0) ("rejects: {0}" -f ($Arguments -join ' '))
+        Check ($code -ne 0) ("rejects: {0}" -f ($Handle.Arguments -join ' '))
     } else {
-        Check ($code -eq 0) ("accepts: {0}" -f ($Arguments -join ' '))
+        Check ($code -eq 0) ("accepts: {0}" -f ($Handle.Arguments -join ' '))
         if ($code -ne 0) { Write-Host $text -ForegroundColor DarkYellow }
     }
-    if ($ExpectedExitCode -ne -999) { Check ($code -eq $ExpectedExitCode) ("exit code {0} for: {1}" -f $ExpectedExitCode, ($Arguments -join ' ')) }
+    if ($ExpectedExitCode -ne -999) { Check ($code -eq $ExpectedExitCode) ("exit code {0} for: {1}" -f $ExpectedExitCode, ($Handle.Arguments -join ' ')) }
     return $text
+}
+function Invoke-Migrate {
+    param([string[]]$Arguments, [switch]$ExpectFailure, [string]$UseScript = '', [int]$TimeoutSeconds = 180, [int]$ExpectedExitCode = -999)
+    $handle = Start-Migrate -Arguments $Arguments -UseScript $UseScript
+    return Complete-Migrate -Handle $handle -ExpectFailure:$ExpectFailure -TimeoutSeconds $TimeoutSeconds -ExpectedExitCode $ExpectedExitCode
 }
 function New-ScratchVolume([string]$Path) {
     New-Item -ItemType Directory -Path $Path -Force | Out-Null
@@ -702,6 +720,37 @@ try {
     Remove-Item -LiteralPath $tamperTarget -Recurse -Force
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'manifest matches disk' 'status agrees after removing the tampered junction'
+
+    # The rollback lease must span snapshot creation, the manifest update and cleanup.
+    Add-File (Join-Path $claudeDest 'rollback-window.txt') 'window'
+    $rollbackMarker = Join-Path $rollbacksRoot '.test-rollback-ready'
+    $rollbackWindow = Start-Migrate -Arguments @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-AcceptDestinationChanges', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'RollbackBeforeManifest' }
+    $markerAppeared = Wait-ForFile $rollbackMarker 30
+    Check $markerAppeared 'rollback pauses after snapshot creation'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Snapshot operation already in progress' 'prune refuses during the rollback manifest window'
+    Set-Content -LiteralPath ($rollbackMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $rollbackWindow
+    Check ((Read-Entry 'claude').state -eq 'Verified') 'rollback completes after the manifest window'
+    Check (-not (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json'))) 'rollback releases its lease after the manifest update'
+    Remove-Item -LiteralPath (Join-Path $claudeDest 'rollback-window.txt') -Force
+    $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
+    Check ((Read-Entry 'claude').state -eq 'Activated') 'claude reactivates after the rollback window test'
+
+    # The restore lease must span the safety snapshot, manifest update and destination swap.
+    $restoreMarker = Join-Path $rollbacksRoot '.test-restore-ready'
+    $restoreWindow = Start-Migrate -Arguments @('-Phase', 'RestoreSnapshot', '-Agent', 'claude', '-SnapshotPath', $crashSnapshot, '-ConfirmAgentsStopped', '-ApproveSnapshotRestore', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'RestoreBeforeSafetyManifest' }
+    $markerAppeared = Wait-ForFile $restoreMarker 30
+    Check $markerAppeared 'restore pauses after the safety snapshot'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Snapshot operation already in progress' 'prune refuses during the restore manifest window'
+    Set-Content -LiteralPath ($restoreMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $restoreWindow
+    Check (Test-Path -LiteralPath (Join-Path $claudeDest 'crash.txt')) 'restore completes after the manifest window'
+    Check (-not (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json'))) 'restore releases its lease after cleanup'
+    Remove-Item -LiteralPath (Join-Path $claudeDest 'crash.txt') -Force
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status agrees after the lease window regressions'
 
     Write-Host ''
     Write-Host '=== cleanup refusals ==='
