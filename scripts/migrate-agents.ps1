@@ -66,6 +66,22 @@ function Assert-NoReparse([string]$Path) {
         throw "Refusing reparse point: $Path"
     }
 }
+function Find-TreeReparsePoint([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $root.FullName }
+    if (-not $root.PSIsContainer) { return $null }
+    $pending = New-Object System.Collections.Stack
+    $pending.Push($root)
+    while ($pending.Count -gt 0) {
+        $dir = $pending.Pop()
+        foreach ($child in @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction Stop)) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $child.FullName }
+            if ($child.PSIsContainer) { $pending.Push($child) }
+        }
+    }
+    return $null
+}
 function Assert-TreeSafe([string]$Path) {
     Assert-NoReparse $Path
     if (Test-Path -LiteralPath $Path) {
@@ -322,6 +338,8 @@ function Get-SnapshotProblems([object]$E, [switch]$Quick) {
     $hashProperty = $E.PSObject.Properties['destinationSnapshotHash']
     if ($null -eq $hashProperty -or [string]::IsNullOrWhiteSpace([string]$hashProperty.Value)) { return @(New-Issue 'snapshot_hash_missing' 'destination snapshot hash missing' $E.id) }
     if ($Quick) { return @() }
+    try { $reparse = Find-TreeReparsePoint $snap } catch { return @(New-Issue 'snapshot_unreadable' 'destination snapshot unreadable' $E.id) }
+    if ($null -ne $reparse) { return @(New-Issue 'snapshot_reparse_point' ("destination snapshot contains a reparse point: {0}" -f $reparse) $E.id) }
     $version = 1
     $versionProperty = $E.PSObject.Properties['destinationSnapshotDigestVersion']
     if ($null -ne $versionProperty) { $version = [int]$versionProperty.Value }
@@ -357,6 +375,10 @@ function Get-SnapshotHistoryProblems([object]$E, [switch]$Quick) {
         if (-not (Test-Path -LiteralPath $path -PathType Container)) { $issues += New-Issue 'snapshot_history_missing' ("snapshot history missing: {0}" -f $path) $E.id; continue }
         $leaf = Split-Path $path -Leaf
         if ($leaf -like '.incomplete-*' -or $leaf -like '.deleting-*' -or $leaf -like '.restore-*') { $issues += New-Issue 'snapshot_history_staging' ("snapshot history points at staging: {0}" -f $path) $E.id; continue }
+        if (-not $Quick) {
+            try { $reparse = Find-TreeReparsePoint $path } catch { $issues += New-Issue 'snapshot_history_unreadable' ("snapshot history unreadable: {0}" -f $path) $E.id; continue }
+            if ($null -ne $reparse) { $issues += New-Issue 'snapshot_history_reparse_point' ("snapshot history contains a reparse point: {0}" -f $reparse) $E.id; continue }
+        }
         $hash = Get-SnapshotRecordHash $record
         if (-not $Quick -and -not [string]::IsNullOrWhiteSpace([string]$hash)) {
             $version = Get-SnapshotRecordVersion $record

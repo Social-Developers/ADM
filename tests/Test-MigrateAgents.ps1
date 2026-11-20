@@ -541,6 +541,18 @@ try {
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'manifest matches disk' 'status accepts the restored historical snapshot'
 
+    # A tampered historical snapshot must be rejected before its bytes are hashed.
+    $historyTamperTarget = Join-Path $runRoot 'history-tamper-target'
+    New-Item -ItemType Directory -Path $historyTamperTarget -Force | Out-Null
+    $historyJunction = Join-Path $olderSnapshot 'history-junction'
+    New-Item -ItemType Junction -Path $historyJunction -Target $historyTamperTarget | Out-Null
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'snapshot history contains a reparse point' 'status rejects a reparse point in snapshot history'
+    [IO.Directory]::Delete($historyJunction)
+    Remove-Item -LiteralPath $historyTamperTarget -Recurse -Force
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status accepts history after removing the reparse point'
+
     Rename-Item -LiteralPath $olderSnapshot -NewName ([IO.Path]::GetFileName($olderSnapshot) + '.away')
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'snapshot history missing' 'status reports a missing historical snapshot'
