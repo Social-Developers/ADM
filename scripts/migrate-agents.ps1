@@ -4,11 +4,15 @@
   Conservative Windows agent-data migration to a user-selected drive\agents.
 .DESCRIPTION
   Phases: Inventory, Copy, Verify, Activate, Rollback, Cleanup, Status,
-  PruneSnapshots, AdoptSnapshots, RestoreSnapshot.
+  PruneSnapshots, AdoptSnapshots, RestoreSnapshot, ReconcileRestore.
   Activation creates legacy-path junctions after moving the original directories
   to same-volume hold directories. Cleanup requires independent verified backup.
   Rollback snapshots are hash-verified, lease-guarded and retained until pruned.
   This script does not relocate application binaries or project repositories.
+.PARAMETER AdditionalSourcesFile
+  Inventory only. Path to a UTF-8 JSON array of extra agent directories, e.g.
+  [{"id":"opencode_config","profilePath":".config\\opencode"}]. Each path is
+  relative to USERPROFILE. Later phases use the paths recorded in the manifest.
 .EXAMPLE
   .\migrate-agents.ps1 -Phase Inventory -DriveLetter D
   .\migrate-agents.ps1 -Phase Copy
@@ -18,16 +22,17 @@
   .\migrate-agents.ps1 -Phase PruneSnapshots -Agent claude -KeepLast 3 -ApproveSnapshotDeletion
   .\migrate-agents.ps1 -Phase AdoptSnapshots -Agent claude -SnapshotPath 'D:\agents\migration\rollbacks\claude-...' -ApproveSnapshotAdoption
   .\migrate-agents.ps1 -Phase RestoreSnapshot -Agent claude -SnapshotPath 'D:\agents\migration\rollbacks\claude-...' -ConfirmAgentsStopped -ApproveSnapshotRestore
+  .\migrate-agents.ps1 -Phase ReconcileRestore -Agent claude -ConfirmAgentsStopped -ApproveRestoreReconciliation
   .\migrate-agents.ps1 -Phase Cleanup -Agent claude -BackupRoot 'R:\agent-migration-backup' -ConfirmAgentsValidated -ApproveDeletion
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [ValidateSet('Inventory','Copy','Verify','Activate','Rollback','Cleanup','Status','PruneSnapshots','AdoptSnapshots','RestoreSnapshot')]
+    [ValidateSet('Inventory','Copy','Verify','Activate','Rollback','Cleanup','Status','PruneSnapshots','AdoptSnapshots','RestoreSnapshot','ReconcileRestore')]
     [string]$Phase = 'Inventory',
     [string]$Root,
     [ValidatePattern('^[A-Za-z]:?$')]
     [string]$DriveLetter,
-    [ValidateSet('all','claude','codex','gemini','cursor','opencode')]
+    [ValidatePattern('^[a-z][a-z0-9_]{0,47}$')]
     [string]$Agent = 'all',
     [string]$BackupRoot,
     [switch]$ConfirmAgentsStopped,
@@ -40,13 +45,16 @@ param(
     [switch]$ApproveSnapshotDeletion,
     [switch]$ApproveSnapshotAdoption,
     [switch]$ApproveSnapshotRestore,
+    [switch]$ApproveRestoreReconciliation,
     [int]$KeepLast = -1,
     [int]$KeepDays = -1,
     [string]$SnapshotPath,
     [switch]$Quick,
     [switch]$AsJson,
     [switch]$Strict,
-    [switch]$DeduplicateSnapshots
+    [switch]$DeduplicateSnapshots,
+    [ValidateNotNullOrEmpty()]
+    [string]$AdditionalSourcesFile
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -98,27 +106,50 @@ function Wait-SnapshotFailpoint([string]$Failpoint, [string]$Marker) {
 function Save-Json([object]$Object, [string]$Path, [switch]$Backup) {
     $tmp = "$Path.tmp.$PID"
     $json = ConvertTo-Json -InputObject $Object -Depth 20
-    [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
-    if (Test-Path -LiteralPath $Path) {
-        if ($Backup) { [IO.File]::Copy($Path, "$Path.bak", $true) }
-        [IO.File]::Replace($tmp, $Path, [NullString]::Value)
-    } else { [IO.File]::Move($tmp, $Path) }
+    $isManifest = $Path -eq $script:ManifestPath
+    $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($json)
+    try {
+        $stream = [IO.File]::Open($tmp, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        if ($isManifest -and $null -ne $script:ManifestHash) {
+            Assert-Condition (-not $script:ManifestFromBackup) 'Manifest was loaded from backup; reconcile the primary manifest before writing.'
+            Assert-Condition ((Test-Path -LiteralPath $Path -PathType Leaf) -and (FileHash $Path) -eq $script:ManifestHash) 'Manifest changed after it was loaded; refusing to overwrite it.'
+        }
+        if (Test-Path -LiteralPath $Path) {
+            if ($Backup) { [IO.File]::Replace($tmp, $Path, "$Path.bak") }
+            else { [IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+        } else { [IO.File]::Move($tmp, $Path) }
+        if ($isManifest) { $script:ManifestHash = FileHash $Path }
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
 }
 function Load-Json([string]$Path) {
     Assert-Condition (Test-Path -LiteralPath $Path -PathType Leaf) "Missing manifest: $Path. Run Inventory first."
-    try { return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json) }
+    try { return (Get-Content -LiteralPath $Path -Encoding UTF8 -Raw | ConvertFrom-Json) }
     catch {
         if (Test-Path -LiteralPath "$Path.bak" -PathType Leaf) {
             Write-Warning "Manifest unreadable; loading backup: $Path.bak"
-            return (Get-Content -LiteralPath "$Path.bak" -Raw | ConvertFrom-Json)
+            $script:ManifestFromBackup = $true
+            return (Get-Content -LiteralPath "$Path.bak" -Encoding UTF8 -Raw | ConvertFrom-Json)
         }
         throw
     }
 }
 function Reload-Manifest {
+    $script:ManifestFromBackup = $false
+    $before = FileHash $script:ManifestPath
     $loaded = Load-Json $script:ManifestPath
+    if ($script:ManifestFromBackup -and $Phase -ne 'Status' -and -not $WhatIfPreference) {
+        throw 'Manifest was loaded from backup; reconcile the primary manifest before writing.'
+    }
+    Assert-Condition ((FileHash $script:ManifestPath) -eq $before) 'Manifest changed while it was being loaded; retry the phase.'
+    $script:ManifestHash = $before
     Assert-Condition ($loaded.schema -eq 1) 'Unsupported manifest schema.'
     Assert-Condition ((FullPath $loaded.root) -ieq $script:Root) 'Root differs from manifest.'
+    if ($Phase -ne 'Status') {
+        foreach ($entry in @(Selected $loaded)) { Assert-NoReparseParents $entry.source }
+    }
     return $loaded
 }
 function FileHash([string]$Path) {
@@ -326,6 +357,44 @@ function Remove-SnapshotRecord([object]$E, [string]$Path) {
     }
     $E | Add-Member -NotePropertyName destinationSnapshots -NotePropertyValue @($remaining) -Force
 }
+function Get-SnapshotRetentionKeys([object]$E) {
+    $keep = @{}
+    $latest = $E.PSObject.Properties['destinationSnapshot']
+    if ($null -ne $latest -and -not [string]::IsNullOrWhiteSpace([string]$latest.Value)) {
+        try { $keep[(FullPath ([string]$latest.Value)).ToLowerInvariant()] = $true } catch { }
+    }
+    $records = @(Get-SnapshotRecords $E)
+    for ($i = 0; $i -lt $records.Count; $i++) {
+        $record = $records[$i]
+        try { $key = (FullPath ([string](Get-SnapshotRecordPath $record))).ToLowerInvariant() } catch { continue }
+        $keepIt = ($KeepLast -ge 0 -and $i -ge ($records.Count - $KeepLast)) -or (Test-SnapshotRecordPinned $record)
+        if ($KeepDays -ge 0) {
+            $created = Get-SnapshotRecordCreatedUtc $record
+            if ($null -eq $created -or $created.ToUniversalTime() -ge [DateTime]::UtcNow.AddDays(-$KeepDays)) { $keepIt = $true }
+        }
+        if ($keepIt) { $keep[$key] = $true }
+    }
+    return $keep
+}
+function Get-SnapshotPathReferences([object]$Manifest, [string]$Path) {
+    $references = @()
+    foreach ($entry in @($Manifest.entries)) {
+        $latest = $entry.PSObject.Properties['destinationSnapshot']
+        if ($null -ne $latest -and -not [string]::IsNullOrWhiteSpace([string]$latest.Value)) {
+            try { $matchesLatest = (FullPath ([string]$latest.Value)) -ieq $Path } catch { $matchesLatest = $false }
+            if ($matchesLatest) {
+                $hash = $entry.PSObject.Properties['destinationSnapshotHash']
+                $version = $entry.PSObject.Properties['destinationSnapshotDigestVersion']
+                $references += [pscustomobject]@{ agent=$entry.id; hash=$(if ($null -ne $hash) { [string]$hash.Value } else { '' }); version=$(if ($null -ne $version) { [int]$version.Value } else { 1 }) }
+            }
+        }
+        foreach ($record in @(Get-SnapshotRecords $entry)) {
+            try { $matchesRecord = (FullPath ([string](Get-SnapshotRecordPath $record))) -ieq $Path } catch { $matchesRecord = $false }
+            if ($matchesRecord) { $references += [pscustomobject]@{ agent=$entry.id; hash=(Get-SnapshotRecordHash $record); version=(Get-SnapshotRecordVersion $record) } }
+        }
+    }
+    return @($references)
+}
 function Get-SnapshotProblems([object]$E, [switch]$Quick) {
     $property = $E.PSObject.Properties['destinationSnapshot']
     if ($null -eq $property) { return @() }
@@ -414,7 +483,7 @@ function Get-SnapshotLeasePath([string]$Rollbacks) { return (Join-Path $Rollback
 function Read-SnapshotLease([string]$Rollbacks) {
     $path = Get-SnapshotLeasePath $Rollbacks
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
-    try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) } catch { return $null }
+    try { return (Get-Content -LiteralPath $path -Encoding UTF8 -Raw | ConvertFrom-Json) } catch { return $null }
 }
 function Test-SnapshotLeaseActive([object]$Lease) {
     if ($null -eq $Lease) { return $false }
@@ -422,15 +491,12 @@ function Test-SnapshotLeaseActive([object]$Lease) {
     if ($null -eq $pidProperty) { return $true }
     $hostProperty = $Lease.PSObject.Properties['host']
     if ($null -eq $hostProperty -or [string]$hostProperty.Value -ne [Environment]::MachineName) { return $true }
-    $startedProperty = $Lease.PSObject.Properties['startedUtc']
-    if ($null -ne $startedProperty) {
-        try {
-            $started = [DateTime]::Parse([string]$startedProperty.Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
-            if ($started.ToUniversalTime() -lt [DateTime]::UtcNow.AddHours(-24)) { return $false }
-        } catch { }
-    }
-    $process = Get-Process -Id ([int]$pidProperty.Value) -ErrorAction SilentlyContinue
-    return ($null -ne $process)
+    try {
+        $ownerId = [int]$pidProperty.Value
+        if ($ownerId -le 0) { return $true }
+        $process = Get-Process -Id $ownerId -ErrorAction SilentlyContinue
+        return ($null -ne $process)
+    } catch { return $true }
 }
 function Assert-NoActiveSnapshotLease([string]$Rollbacks) {
     if (-not (Test-Path -LiteralPath $Rollbacks -PathType Container)) { return }
@@ -443,6 +509,9 @@ function Assert-NoActiveSnapshotLease([string]$Rollbacks) {
 function Enter-SnapshotLease([string]$Rollbacks, [string]$Agent, [string]$Staging, [string]$Snapshot) {
     New-Item -ItemType Directory -Path $Rollbacks -Force | Out-Null
     Wait-SnapshotFailpoint 'BeforeSnapshotLease' (Join-Path $Rollbacks '.test-before-lease')
+    $guardPath = Join-Path $Rollbacks '.snapshot-lease.lock'
+    try { $script:SnapshotLeaseGuard = [IO.File]::Open($guardPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch [IO.IOException] { throw 'Snapshot operation already in progress (lease guard held).' }
     $path = Get-SnapshotLeasePath $Rollbacks
     $lease = [pscustomobject]@{
         pid = $PID; host = [Environment]::MachineName; agent = $Agent; startedUtc = [DateTime]::UtcNow.ToString('o')
@@ -450,45 +519,40 @@ function Enter-SnapshotLease([string]$Rollbacks, [string]$Agent, [string]$Stagin
     }
     $json = ConvertTo-Json -InputObject $lease -Depth 10
     $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($json)
-    for ($attempt = 0; $attempt -lt 4; $attempt++) {
-        try {
-            $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-            try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
-            return $lease
-        } catch [IO.IOException] {
-            $existing = $null
-            for ($readAttempt = 0; $readAttempt -lt 3; $readAttempt++) {
-                $existing = Read-SnapshotLease $Rollbacks
-                if ($null -ne $existing) { break }
-                Start-Sleep -Milliseconds 50
-            }
-            if ($null -eq $existing) {
-                $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
-                if ($null -ne $item -and $item.LastWriteTimeUtc -gt [DateTime]::UtcNow.AddSeconds(-10)) {
-                    throw 'Snapshot operation already in progress (lease unreadable).'
-                }
-                Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-                continue
-            }
+    try {
+        if (Test-Path -LiteralPath $path) {
+            $existing = Read-SnapshotLease $Rollbacks
+            if ($null -eq $existing) { throw "Snapshot lease is unreadable; inspect it before retrying: $path" }
             if (Test-SnapshotLeaseActive $existing) {
                 $existingAgent = if ($null -ne $existing.PSObject.Properties['agent']) { [string]$existing.agent } else { 'unknown' }
                 $existingPid = if ($null -ne $existing.PSObject.Properties['pid']) { $existing.pid } else { 'unknown' }
                 throw "Snapshot operation already in progress for $existingAgent (PID $existingPid)."
             }
-            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
         }
+        $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        Wait-SnapshotFailpoint 'AfterSnapshotLease' (Join-Path $Rollbacks '.test-after-lease')
+        return $lease
+    } catch {
+        $script:SnapshotLeaseGuard.Dispose()
+        $script:SnapshotLeaseGuard = $null
+        throw
     }
-    throw "Could not acquire the snapshot lease: $path"
 }
 function Remove-OwnSnapshotLease([string]$Rollbacks) {
-    $lease = Read-SnapshotLease $Rollbacks
-    if ($null -eq $lease) { return }
-    $pidProperty = $lease.PSObject.Properties['pid']
-    $hostProperty = $lease.PSObject.Properties['host']
-    if ($null -eq $pidProperty -or $null -eq $hostProperty) { return }
-    if ([int]$pidProperty.Value -ne $PID) { return }
-    if ([string]$hostProperty.Value -ne [Environment]::MachineName) { return }
-    Remove-Item -LiteralPath (Get-SnapshotLeasePath $Rollbacks) -Force -ErrorAction SilentlyContinue
+    try {
+        $lease = Read-SnapshotLease $Rollbacks
+        if ($null -eq $lease) { return }
+        $pidProperty = $lease.PSObject.Properties['pid']
+        $hostProperty = $lease.PSObject.Properties['host']
+        if ($null -eq $pidProperty -or $null -eq $hostProperty) { return }
+        if ([int]$pidProperty.Value -ne $PID) { return }
+        if ([string]$hostProperty.Value -ne [Environment]::MachineName) { return }
+        Remove-Item -LiteralPath (Get-SnapshotLeasePath $Rollbacks) -Force -ErrorAction Stop
+    } finally {
+        if ($null -ne $script:SnapshotLeaseGuard) { $script:SnapshotLeaseGuard.Dispose(); $script:SnapshotLeaseGuard = $null }
+    }
 }
 function Invoke-SnapshotDedupe([string]$Snapshot, [string]$Previous) {
     $previousFiles = @{}
@@ -612,6 +676,35 @@ function Require-Root {
     $script:Registry = Join-Path $script:Root 'registry'
     $script:ManifestPath = Join-Path $script:Registry 'migration-manifest.json'
 }
+function Assert-NoReparseParents([string]$Path) {
+    for ($parent = [IO.Directory]::GetParent($Path); $null -ne $parent; $parent = $parent.Parent) {
+        Assert-NoReparse $parent.FullName
+    }
+}
+function Read-AdditionalSources([string]$Path, [string]$Profile, [array]$Defaults) {
+    $json = Get-Content -LiteralPath $Path -Encoding UTF8 -Raw
+    Assert-Condition ($json -and $json.TrimStart().StartsWith('[')) 'Additional sources must be a JSON array of {id, profilePath} records.'
+    $knownIds = @{}
+    foreach ($c in $Defaults) { $knownIds[$c.id] = $true }
+    $records = ConvertFrom-Json -InputObject $json
+    foreach ($record in $records) {
+        Assert-Condition ($null -ne $record -and $record.PSObject.Properties['id'] -and $record.PSObject.Properties['profilePath']) 'Each additional source requires id and profilePath.'
+        $id = $record.id
+        Assert-Condition ($id -is [string] -and $id -cmatch '\A[a-z][a-z0-9_]{0,47}\z' -and $id -notmatch '^(all|con|prn|aux|nul|com[1-9]|lpt[1-9])$') "Invalid additional agent id: $id"
+        Assert-Condition (-not $knownIds.ContainsKey($id)) "Duplicate agent id: $id"
+        $knownIds[$id] = $true
+        $relative = $record.profilePath
+        Assert-Condition ($relative -is [string] -and -not [string]::IsNullOrWhiteSpace($relative) -and -not [IO.Path]::IsPathRooted($relative)) "Expected a profile-relative directory for ${id}."
+        $segments = @($relative -split '[/\\]')
+        foreach ($part in $segments) {
+            Assert-Condition ($part -and $part.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -lt 0 -and $part -notmatch '([. ]$|\.qagents-migration-hold$|~[0-9]+(\.|$)|^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$))') "Invalid profile path component for ${id}: $part"
+        }
+        $source = FullPath (Join-Path $Profile ($segments -join '\'))
+        Assert-Condition ((IsWithin $source $Profile) -and $source -ine (FullPath $Profile)) "Source must be inside the user profile: $source"
+        Assert-Condition (($segments -join '\') -notmatch '^(AppData(\\(Local|LocalLow|Roaming))?|\.config|\.local(\\(share|state))?|Desktop|Documents|Downloads|Pictures|Videos|Music)$') "Select a dedicated agent directory, not a shared profile folder: $source"
+        @{id=$id; path=$source}
+    }
+}
 function Discover {
     $homePath = $env:USERPROFILE
     $candidates = @(
@@ -621,13 +714,22 @@ function Discover {
         @{id='cursor'; path=(Join-Path $homePath '.cursor')},
         @{id='opencode'; path=(Join-Path $env:APPDATA 'opencode')}
     )
+    $defaultIds = @($candidates | ForEach-Object { $_.id })
+    if ($AdditionalSourcesFile) { $candidates += @(Read-AdditionalSources $AdditionalSourcesFile $homePath $candidates) }
     $out = @()
     foreach ($c in $candidates) {
         if ($Agent -ne 'all' -and $Agent -ne $c.id) { continue }
-        if (-not (Test-Path -LiteralPath $c.path -PathType Container)) { continue }
+        if (-not (Test-Path -LiteralPath $c.path -PathType Container)) {
+            Assert-Condition ($defaultIds -contains $c.id) "Additional source is not an existing directory: $($c.path)"
+            continue
+        }
+        Assert-NoReparseParents $c.path
+        Assert-Condition (-not (IsWithin $script:Root $c.path) -and -not (IsWithin $c.path $script:Root)) "Source overlaps migration root: $($c.path)"
+        foreach ($previous in $out) {
+            Assert-Condition (-not (IsWithin $c.path $previous.source) -and -not (IsWithin $previous.source $c.path)) "Overlapping agent directories: $($c.path) and $($previous.source)"
+        }
         Assert-TreeSafe $c.path
         $dest = Join-Path (Join-Path $script:Root 'agents') $c.id
-        Assert-Condition (-not (IsWithin $dest $c.path)) "Destination nested inside source: $($c.path)"
         $files = @(Files-In $c.path)
         $bytes = [long]0
         foreach ($f in $files) { $bytes += $f.Length }
@@ -638,6 +740,7 @@ function Discover {
 function Update-State([object]$Manifest, [object]$Entry, [string]$State) {
     $Entry.state = $State
     $Manifest.updatedUtc = [DateTime]::UtcNow.ToString('o')
+    Wait-SnapshotFailpoint 'BeforeStateSave' (Join-Path (Join-Path $script:Root 'migration\rollbacks') '.test-state-save')
     Save-Json $Manifest $script:ManifestPath -Backup
 }
 function Ensure-Skeleton {
@@ -669,8 +772,20 @@ function Make-SkillsRegistry([object]$Manifest) {
 }
 
 Require-Root
+if ($AdditionalSourcesFile -and $Phase -ne 'Inventory') {
+    throw '-AdditionalSourcesFile applies only to Inventory. Later phases use the recorded manifest.'
+}
+if ($WhatIfPreference -and $Phase -in @('Inventory', 'Copy', 'Verify')) {
+    throw "-WhatIf is not supported for $Phase; no changes were made."
+}
+$script:ManifestHash = $null
+$script:ManifestFromBackup = $false
+$script:SnapshotLeaseGuard = $null
 if ($Phase -eq 'Inventory') {
     Ensure-Skeleton
+    $rollbacks = Join-Path $script:Root 'migration\rollbacks'
+    $lease = Enter-SnapshotLease $rollbacks $Agent '' ''
+    try {
     Assert-Condition (-not (Test-Path -LiteralPath $script:ManifestPath)) 'Manifest already exists. Inspect Status; do not overwrite migration state.'
     $entries = @(Discover)
     Assert-Condition ($entries.Count -gt 0) 'No supported agent data directories found.'
@@ -681,13 +796,32 @@ if ($Phase -eq 'Inventory') {
     $manifest = [pscustomobject]@{schema=1; createdUtc=[DateTime]::UtcNow.ToString('o'); updatedUtc=[DateTime]::UtcNow.ToString('o'); root=$script:Root; entries=$entries}
     Save-Json $manifest $script:ManifestPath
     $entries | Format-Table id,files,bytes,source,destination -AutoSize
+    if ($Agent -in @('claude', 'all')) {
+        foreach ($name in @('.claude.json', '.claude.json.backup')) {
+            $sibling = Join-Path $env:USERPROFILE $name
+            if (Test-Path -LiteralPath $sibling -PathType Leaf) { Write-Warning "Standalone file not migrated: $sibling" }
+        }
+    }
     Write-Host "Inventory saved: $script:ManifestPath"
+    } finally { Remove-OwnSnapshotLease $rollbacks }
     exit 0
 }
 $manifest = Reload-Manifest
 $entries = @(Selected $manifest)
 Assert-Condition ($entries.Count -gt 0) 'No matching agents in manifest.'
 
+$manifestWriterLease = $false
+$rollbacks = Join-Path $script:Root 'migration\rollbacks'
+if ($Phase -in @('Copy', 'Verify', 'Activate', 'Cleanup') -and -not $WhatIfPreference) {
+    $lease = Enter-SnapshotLease $rollbacks $Agent '' ''
+    $manifestWriterLease = $true
+}
+try {
+if ($manifestWriterLease) {
+    $manifest = Reload-Manifest
+    $entries = @(Selected $manifest)
+    Assert-Condition ($entries.Count -gt 0) 'No matching agents in manifest.'
+}
 switch ($Phase) {
     'Status' {
         $rollbacks = Join-Path $script:Root 'migration\rollbacks'
@@ -705,6 +839,15 @@ switch ($Phase) {
             }
         }
         $globalIssues = @()
+        if (Test-Path -LiteralPath $rollbacks -PathType Container) {
+            foreach ($recovery in @(Get-ChildItem -LiteralPath $rollbacks -File -Force -Filter '.deleting-*.recovery.json')) {
+                $pendingPath = $recovery.FullName.Substring(0, $recovery.FullName.Length - '.recovery.json'.Length)
+                if (-not (Test-Path -LiteralPath $pendingPath -PathType Container)) {
+                    $globalIssues += New-Issue 'snapshot_recovery_pending' ("Snapshot deletion recovery record requires reconciliation under {0}: {1}" -f $rollbacks, $recovery.Name)
+                }
+            }
+        }
+        if ($null -eq $lease -and (Test-Path -LiteralPath (Get-SnapshotLeasePath $rollbacks))) { $globalIssues += New-Issue 'snapshot_lease_unreadable' ("Unreadable snapshot operation lease under {0}; inspect it before retrying" -f $rollbacks) }
         if ($null -ne $lease -and -not $leaseActive) { $globalIssues += New-Issue 'snapshot_lease_stale' ("Stale snapshot operation lease under {0}" -f $rollbacks) }
         if ($leaseActive) {
             $leaseAgent = if ($null -ne $lease.PSObject.Properties['agent']) { [string]$lease.agent } else { 'unknown' }
@@ -737,7 +880,10 @@ switch ($Phase) {
         foreach ($dir in $orphanStaging) { $globalIssues += New-Issue 'staging_orphaned' ("Orphaned snapshot staging folder under {0}: {1}" -f $rollbacks, $dir.Name) }
         foreach ($dir in $restoreStaging) { $globalIssues += New-Issue 'restore_staging_orphaned' ("Orphaned restore staging folder under {0}: {1}" -f $rollbacks, $dir.Name) }
         foreach ($dir in $unreferencedSnapshots) { $globalIssues += New-Issue 'snapshot_unreferenced' ("Unreferenced destination snapshot folder under {0}: {1}" -f $rollbacks, $dir.Name) }
-        foreach ($dir in $deletingSnapshots) { $globalIssues += New-Issue 'snapshot_delete_pending' ("Pending snapshot deletion under {0}: {1}" -f $rollbacks, $dir.Name) }
+        foreach ($dir in $deletingSnapshots) {
+            if ($leaseActive) { $globalIssues += New-Issue 'snapshot_delete_active' ("Snapshot deletion may be in progress under {0}: {1}" -f $rollbacks, $dir.Name) }
+            else { $globalIssues += New-Issue 'snapshot_delete_pending' ("Pending snapshot deletion under {0}: {1}" -f $rollbacks, $dir.Name) }
+        }
         $report = @()
         $allIssues = @()
         $restoreAlerts = @()
@@ -823,6 +969,7 @@ switch ($Phase) {
             Assert-Condition (-not (Test-Path -LiteralPath $e.hold)) 'Unexpected hold directory.'
             Assert-Condition (-not (Test-Path -LiteralPath $e.destination)) 'Destination exists: manual reconciliation required.'
             Copy-Tree $e.source $e.destination
+            Wait-SnapshotFailpoint 'CopyBeforeManifest' (Join-Path $rollbacks '.test-copy-ready')
             Update-State $manifest $e 'Copied'
             Write-Host "Copied and hashed: $($e.id)"
         }
@@ -1026,60 +1173,117 @@ switch ($Phase) {
             $manifest = Reload-Manifest
             $entries = @(Selected $manifest)
         }
-        if (-not $WhatIfPreference) {
-            foreach ($pending in @(Get-ChildItem -LiteralPath $rollbacks -Directory -Force -Filter '.deleting-*')) {
-                Remove-Item -LiteralPath $pending.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        $pendingPaths = @{}
+        $pendingDirs = @(Get-ChildItem -LiteralPath $rollbacks -Directory -Force -Filter '.deleting-*')
+        foreach ($pending in $pendingDirs) {
+            $journalPath = $pending.FullName + '.recovery.json'
+            Assert-Condition (Test-Path -LiteralPath $journalPath -PathType Leaf) "Pending snapshot deletion has no recovery record; reconcile it manually: $($pending.FullName)"
+        }
+        foreach ($journalFile in @(Get-ChildItem -LiteralPath $rollbacks -File -Force -Filter '.deleting-*.recovery.json')) {
+            Assert-NoReparse $journalFile.FullName
+            try { $journal = Get-Content -LiteralPath $journalFile.FullName -Encoding UTF8 -Raw | ConvertFrom-Json } catch { throw "Unreadable snapshot deletion recovery record: $($journalFile.FullName)" }
+            try {
+                $ownerId = [string]$journal.agent
+                $original = FullPath ([string]$journal.path)
+                $record = $journal.record
+                $index = [int]$journal.index
+                $pendingPath = $journalFile.FullName.Substring(0, $journalFile.FullName.Length - '.recovery.json'.Length)
+                $recordPath = FullPath ([string](Get-SnapshotRecordPath $record))
+                $hash = [string](Get-SnapshotRecordHash $record)
+                $version = Get-SnapshotRecordVersion $record
+            } catch { throw "Invalid snapshot deletion recovery record: $($journalFile.FullName)" }
+            $owner = @($manifest.entries | Where-Object { $_.id -eq $ownerId })
+            $schemaProperty = $journal.PSObject.Properties['schema']
+            Assert-Condition ($null -ne $schemaProperty -and $schemaProperty.Value -eq 1 -and $owner.Count -eq 1 -and $index -ge 0 -and $original -ieq $recordPath -and (Split-Path $original -Parent) -ieq (FullPath $rollbacks) -and (Split-Path $original -Leaf) -notlike '.*' -and (Split-Path $pendingPath -Leaf) -match ('^\.deleting-' + [regex]::Escape($ownerId) + '-[0-9a-f]{32}$') -and $hash -match '^[0-9a-fA-F]{64}$' -and $version -in @(1, 2)) "Invalid snapshot deletion recovery record: $($journalFile.FullName)"
+            $key = $original.ToLowerInvariant()
+            Assert-Condition (-not $pendingPaths.ContainsKey($key)) "Multiple pending deletions for snapshot: $original"
+            $pendingPaths[$key] = $true
+            if ($Agent -ne 'all' -and $Agent -ne $ownerId) { Write-Warning "Pending deletion belongs to unselected agent ${ownerId}: $pendingPath"; continue }
+            $hasPending = Test-Path -LiteralPath $pendingPath -PathType Container
+            $hasOriginal = Test-Path -LiteralPath $original
+            Assert-Condition (-not ($hasPending -and $hasOriginal)) "Both pending and original snapshot exist; reconcile manually: $original"
+            Assert-Condition ($hasPending -or $hasOriginal) "Pending and original snapshot are both missing; reconcile manually: $original"
+            $source = if ($hasPending) { $pendingPath } else { $original }
+            Assert-TreeSafe $source
+            $actual = Get-TreeDigest $source $version
+            Assert-Condition ($actual -eq $hash.ToLowerInvariant()) "Pending snapshot digest does not match; reconcile manually: $source"
+            $references = @(Get-SnapshotPathReferences $manifest $original)
+            foreach ($reference in $references) {
+                Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$reference.hash) -and $reference.version -in @(1, 2)) "Snapshot reference lacks a usable digest; reconcile manually: $original"
+                $referenceDigest = if ($reference.version -eq $version) { $actual } else { Get-TreeDigest $source $reference.version }
+                Assert-Condition ($referenceDigest -eq ([string]$reference.hash).ToLowerInvariant()) "Snapshot reference digest does not match; reconcile manually: $original"
             }
+            if ($WhatIfPreference) { Write-Host "would reconcile pending snapshot: $source -> $original" }
+            elseif ($hasPending) { Move-Item -LiteralPath $pendingPath -Destination $original -ErrorAction Stop }
+            $ownerEntry = $owner[0]
+            $ownerRecords = @(Get-SnapshotRecords $ownerEntry)
+            $ownerHasRecord = $false
+            foreach ($existingRecord in $ownerRecords) {
+                try { if ((FullPath ([string](Get-SnapshotRecordPath $existingRecord))) -ieq $original) { $ownerHasRecord = $true; break } } catch { }
+            }
+            if (-not $ownerHasRecord) {
+                $restoredRecords = @()
+                $insertAt = [Math]::Min($index, $ownerRecords.Count)
+                for ($i = 0; $i -le $ownerRecords.Count; $i++) {
+                    if ($i -eq $insertAt) { $restoredRecords += $record }
+                    if ($i -lt $ownerRecords.Count) { $restoredRecords += $ownerRecords[$i] }
+                }
+                $ownerEntry | Add-Member -NotePropertyName destinationSnapshots -NotePropertyValue @($restoredRecords) -Force
+                if (-not $WhatIfPreference) { Save-Json $manifest $script:ManifestPath -Backup }
+            }
+            if ($WhatIfPreference) { $pendingPaths.Remove($key); continue }
+            $sidecar = Get-SnapshotSidecarPath $original
+            if (-not (Test-Path -LiteralPath $sidecar) -and $record -isnot [string]) { Save-SnapshotSidecar $original $record $ownerId }
+            Remove-Item -LiteralPath $journalFile.FullName -Force -ErrorAction Stop
+            $pendingPaths.Remove($key)
+            Write-Host "Reconciled pending snapshot: $original"
         }
         foreach ($e in $entries) {
             $records = @(Get-SnapshotRecords $e)
             if ($records.Count -eq 0) { continue }
-            $latestPath = $null
-            $latestProperty = $e.PSObject.Properties['destinationSnapshot']
-            if ($null -ne $latestProperty -and -not [string]::IsNullOrWhiteSpace([string]$latestProperty.Value)) {
-                try { $latestPath = FullPath ([string]$latestProperty.Value) } catch { $latestPath = $null }
-            }
-            $latestKey = if ($null -ne $latestPath) { $latestPath.ToLowerInvariant() } else { $null }
-            $keep = @{}
-            if ($null -ne $latestKey) { $keep[$latestKey] = $true }
+            $keep = Get-SnapshotRetentionKeys $e
             $count = $records.Count
-            for ($i = 0; $i -lt $count; $i++) {
-                $record = $records[$i]
-                $raw = Get-SnapshotRecordPath $record
-                if ([string]::IsNullOrWhiteSpace([string]$raw)) { continue }
-                try { $key = (FullPath ([string]$raw)).ToLowerInvariant() } catch { continue }
-                $keepIt = $false
-                if ($KeepLast -ge 0 -and $i -ge ($count - $KeepLast)) { $keepIt = $true }
-                if ($KeepDays -ge 0) {
-                    $created = Get-SnapshotRecordCreatedUtc $record
-                    if ($null -eq $created -or $created.ToUniversalTime() -ge [DateTime]::UtcNow.AddDays(-$KeepDays)) { $keepIt = $true }
-                }
-                if (Test-SnapshotRecordPinned $record) { $keepIt = $true }
-                if ($keepIt) { $keep[$key] = $true }
-            }
             for ($i = 0; $i -lt $count; $i++) {
                 $record = $records[$i]
                 $raw = Get-SnapshotRecordPath $record
                 if ([string]::IsNullOrWhiteSpace([string]$raw)) { continue }
                 try { $full = FullPath ([string]$raw) } catch { continue }
                 $key = $full.ToLowerInvariant()
-                if ($keep.ContainsKey($key)) { continue }
-                if ($null -ne $latestKey -and $key -eq $latestKey) { continue }
+                if ($keep.ContainsKey($key) -or $pendingPaths.ContainsKey($key)) { continue }
                 if ($full -ieq (FullPath $rollbacks) -or -not (IsWithin $full $rollbacks)) { throw "Refusing to prune a snapshot outside rollbacks: $full" }
-                if ($WhatIfPreference) { Write-Host "would prune snapshot: $full"; continue }
+                $otherReferences = @(Get-SnapshotPathReferences $manifest $full | Where-Object { $_.agent -ne $e.id })
+                if ($otherReferences.Count -gt 0) { Write-Warning "Snapshot is referenced by another agent; keeping it: $full"; continue }
+                if ($WhatIfPreference) { Write-Host "would prune snapshot after reconciliation: $full"; continue }
+                Assert-Condition ((Split-Path $full -Parent) -ieq (FullPath $rollbacks)) "Refusing to prune a snapshot outside the rollbacks root: $full"
                 if (-not (Test-Path -LiteralPath $full -PathType Container)) {
+                    $sidecar = Get-SnapshotSidecarPath $full
+                    if (Test-Path -LiteralPath $sidecar -PathType Leaf) { Remove-Item -LiteralPath $sidecar -Force -ErrorAction Stop }
                     Remove-SnapshotRecord $e $full
                     Save-Json $manifest $script:ManifestPath -Backup
                     Write-Host "Pruned missing snapshot record: $full"
                     continue
                 }
+                $recordHash = [string](Get-SnapshotRecordHash $record)
+                $recordVersion = Get-SnapshotRecordVersion $record
+                Assert-Condition ($recordHash -match '^[0-9a-fA-F]{64}$' -and $recordVersion -in @(1, 2)) "Snapshot lacks a usable recovery digest: $full"
+                Assert-TreeSafe $full
+                Assert-Condition ((Get-TreeDigest $full $recordVersion) -eq $recordHash.ToLowerInvariant()) "Snapshot digest does not match; refusing prune: $full"
                 $deleting = Join-Path $rollbacks ('.deleting-' + $e.id + '-' + [guid]::NewGuid().ToString('N'))
+                $journalPath = $deleting + '.recovery.json'
+                $currentRecords = @(Get-SnapshotRecords $e)
+                $currentIndex = -1
+                for ($j = 0; $j -lt $currentRecords.Count; $j++) {
+                    if ((FullPath ([string](Get-SnapshotRecordPath $currentRecords[$j]))) -ieq $full) { $currentIndex = $j; break }
+                }
+                Assert-Condition ($currentIndex -ge 0) "Snapshot record disappeared before pruning: $full"
+                Save-Json ([pscustomobject]@{ schema=1; agent=$e.id; path=$full; record=$record; index=$currentIndex }) $journalPath
                 Move-Item -LiteralPath $full -Destination $deleting -ErrorAction Stop
+                $sidecar = Get-SnapshotSidecarPath $full
+                if (Test-Path -LiteralPath $sidecar -PathType Leaf) { Remove-Item -LiteralPath $sidecar -Force -ErrorAction Stop }
                 Remove-SnapshotRecord $e $full
                 Save-Json $manifest $script:ManifestPath -Backup
-                Remove-Item -LiteralPath $deleting -Recurse -Force -ErrorAction SilentlyContinue
-                $sidecar = Get-SnapshotSidecarPath $full
-                if (Test-Path -LiteralPath $sidecar) { Remove-Item -LiteralPath $sidecar -Force -ErrorAction SilentlyContinue }
+                Remove-Item -LiteralPath $deleting -Recurse -Force -ErrorAction Stop
+                Remove-Item -LiteralPath $journalPath -Force -ErrorAction Stop
                 Write-Host "Pruned snapshot: $full"
             }
             if (-not $WhatIfPreference -and (Ensure-LatestSnapshotRecord $e)) { Save-Json $manifest $script:ManifestPath -Backup }
@@ -1142,7 +1346,7 @@ switch ($Phase) {
             $sidecarPath = Get-SnapshotSidecarPath $path
             if (Test-Path -LiteralPath $sidecarPath -PathType Leaf) {
                 try {
-                    $sidecar = Get-Content -LiteralPath $sidecarPath -Raw | ConvertFrom-Json
+                    $sidecar = Get-Content -LiteralPath $sidecarPath -Encoding UTF8 -Raw | ConvertFrom-Json
                     $sidecarVersion = $sidecar.PSObject.Properties['digestVersion']
                     if ($null -ne $sidecarVersion) { $version = [int]$sidecarVersion.Value }
                 } catch { }
@@ -1160,6 +1364,92 @@ switch ($Phase) {
             try { Save-SnapshotSidecar $path $record $owner.id } catch { Write-Warning "Snapshot sidecar not written: $($_.Exception.Message)" }
             Write-Host "Adopted snapshot: $path ($($owner.id))"
         }
+        } finally {
+            if ($leaseHeld) { Remove-OwnSnapshotLease $rollbacks }
+        }
+        break
+    }
+    'ReconcileRestore' {
+        Assert-Condition ($Agent -ne 'all') 'Select one agent with -Agent for restore reconciliation.'
+        $rollbacks = Join-Path $script:Root 'migration\rollbacks'
+        Assert-Condition (Test-Path -LiteralPath $rollbacks -PathType Container) 'No rollbacks folder.'
+        Assert-NoActiveSnapshotLease $rollbacks
+        if (-not $WhatIfPreference) {
+            Assert-Condition $ConfirmAgentsStopped 'Close affected agents and pass -ConfirmAgentsStopped.'
+            Assert-Condition $ApproveRestoreReconciliation 'Explicit -ApproveRestoreReconciliation is required.'
+        }
+        $leaseHeld = -not $WhatIfPreference
+        if ($leaseHeld) { $lease = Enter-SnapshotLease $rollbacks $Agent '' '' }
+        try {
+            if ($leaseHeld) {
+                $manifest = Reload-Manifest
+                $entries = @(Selected $manifest)
+            }
+            Assert-Condition ($entries.Count -eq 1) 'Select exactly one manifest entry.'
+            $e = $entries[0]
+            Assert-Condition ($e.state -in @('Activated', 'BackupVerified')) "Cannot reconcile restore for $($e.id) in state $($e.state)"
+            $destination = FullPath $e.destination
+            $destinationParent = Split-Path $destination -Parent
+            $destinationLeaf = Split-Path $destination -Leaf
+            $expectedParent = FullPath (Join-Path $script:Root 'agents')
+            Assert-Condition ($destinationParent -ieq $expectedParent -and $destinationLeaf -ieq $e.id) 'Unexpected destination path; reconcile manually.'
+            Assert-NoReparse $script:Root
+            Assert-NoReparse $destinationParent
+            Assert-NoReparse (Split-Path $rollbacks -Parent)
+            Assert-NoReparse $rollbacks
+            $backups = @(Get-ChildItem -LiteralPath $destinationParent -Force -ErrorAction Stop | Where-Object { $_.Name -like ($destinationLeaf + '.pre-restore-*') })
+            $staging = @(Get-ChildItem -LiteralPath $rollbacks -Force -ErrorAction Stop | Where-Object { $_.Name -like ('.restore-' + $e.id + '-*') })
+            foreach ($item in @($backups) + @($staging)) {
+                Assert-Condition $item.PSIsContainer "Restore artifact is not a directory; reconcile manually: $($item.FullName)"
+                Assert-TreeSafe $item.FullName
+            }
+            $destinationExists = Test-Path -LiteralPath $destination
+            if ($destinationExists) {
+                Assert-Condition (Test-Path -LiteralPath $destination -PathType Container) 'Destination is not a directory; reconcile manually.'
+                Assert-TreeSafe $destination
+            } else {
+                Assert-Condition ($backups.Count -eq 1) 'Destination is missing and there is not exactly one stranded backup; reconcile manually.'
+            }
+            Assert-Condition (($backups.Count + $staging.Count) -gt 0) 'No restore artifacts to reconcile.'
+            $restoreBackup = if (-not $destinationExists) { $backups[0] } else { $null }
+            $preserve = @($staging)
+            foreach ($backup in $backups) { if ($null -eq $restoreBackup -or $backup.FullName -ine $restoreBackup.FullName) { $preserve += $backup } }
+            foreach ($item in @($backups) + @($staging)) {
+                foreach ($manifestEntry in @($manifest.entries)) {
+                    foreach ($referencePath in @(Get-SnapshotReferencePaths $manifestEntry)) {
+                        try { $referenceFull = FullPath ([string]$referencePath) } catch { throw 'Invalid snapshot reference; reconcile manually.' }
+                        Assert-Condition (-not (IsWithin $referenceFull $item.FullName) -and -not (IsWithin $item.FullName $referenceFull)) "Restore artifact overlaps a snapshot reference; reconcile manually: $($item.FullName)"
+                    }
+                }
+            }
+            $quarantineRoot = Join-Path (Join-Path $script:Root 'migration') 'restore-reconciliation'
+            Assert-NoReparse $quarantineRoot
+            $quarantine = Join-Path $quarantineRoot ($e.id + '-' + [guid]::NewGuid().ToString('N'))
+            if ($null -ne $restoreBackup) { Write-Host "would restore stranded destination: $($restoreBackup.FullName) -> $destination" }
+            foreach ($item in $preserve) {
+                $kind = if ($item.Parent.FullName -ieq $destinationParent) { 'backup' } else { 'staging' }
+                Write-Host "would preserve $kind`: $($item.FullName) -> $(Join-Path $quarantine ($kind + '-' + $item.Name))"
+            }
+            if ($WhatIfPreference) { break }
+            if ($preserve.Count -gt 0) {
+                if (-not (Test-Path -LiteralPath $quarantineRoot)) { New-Item -ItemType Directory -Path $quarantineRoot -ErrorAction Stop | Out-Null }
+                Assert-NoReparse $quarantineRoot
+                Assert-Condition (-not (Test-Path -LiteralPath $quarantine)) 'Reconciliation directory already exists; refusing overwrite.'
+                New-Item -ItemType Directory -Path $quarantine -ErrorAction Stop | Out-Null
+                foreach ($item in $preserve) {
+                    $kind = if ($item.Parent.FullName -ieq $destinationParent) { 'backup' } else { 'staging' }
+                    $preservedPath = Join-Path $quarantine ($kind + '-' + $item.Name)
+                    Assert-Condition (-not (Test-Path -LiteralPath $preservedPath)) "Reconciliation target already exists: $preservedPath"
+                    Move-Item -LiteralPath $item.FullName -Destination $preservedPath -ErrorAction Stop
+                }
+            }
+            if ($null -ne $restoreBackup) {
+                Assert-Condition (-not (Test-Path -LiteralPath $destination)) 'Destination appeared during reconciliation; refusing overwrite.'
+                Rename-Item -LiteralPath $restoreBackup.FullName -NewName $destinationLeaf -ErrorAction Stop
+                Write-Host "Restored stranded destination: $destination"
+            }
+            if ($preserve.Count -gt 0) { Write-Host "Preserved restore artifacts for review: $quarantine" }
+            Write-Host "Restore reconciliation complete for $($e.id)."
         } finally {
             if ($leaseHeld) { Remove-OwnSnapshotLease $rollbacks }
         }
@@ -1263,4 +1553,7 @@ switch ($Phase) {
         }
         break
     }
+}
+} finally {
+    if ($manifestWriterLease) { Remove-OwnSnapshotLease $rollbacks }
 }

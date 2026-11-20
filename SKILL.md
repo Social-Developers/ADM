@@ -11,7 +11,9 @@ Use the **bundled** `scripts/migrate-agents.ps1` as the sole migration engine. I
 
 Shared-skill linkage is likewise a bundled step: use `scripts\Link-SharedSkills.ps1` rather than hand-creating skill links or repeated `New-Item -ItemType Junction` commands of your own.
 
-The bundled implementation supports **user-profile** directories for `claude`, `codex`, `gemini`, `cursor`, and `opencode` (see `Discover` in the script for exact source paths). It does **not** relocate application binaries, all AppData trees, project-level instructions, repositories, custom agent paths, or unknown agents. The migration script creates the shared pool and a skills inventory, but it never deduplicates, converts, or installs skills across agents; compatibility must be assessed separately. Linking is a separate, explicitly invoked step performed by `scripts\Link-SharedSkills.ps1`, which discovers each agent's own skills directory and refuses to guess. Never claim automatic cross-agent skill installation.
+The script discovers **user-profile** directories for `claude`, `codex`, `gemini`, `cursor`, and `opencode`. For another agent or a second data directory, review its exact path with the user before the first Inventory. Pass `-AdditionalSourcesFile <path>` to Inventory only. The file is a UTF-8 JSON array, for example `[{"id":"opencode_config","profilePath":".config\\opencode"}]`. Use a unique lowercase ID and an existing, dedicated directory relative to `%USERPROFILE%`; never select a whole profile, shared folder, application installation or project repository. Later phases use the manifest ID, not the configuration file.
+
+Standalone files beside those directories stay on the source drive. Report any such files to the user, including Inventory warnings about `.claude.json` or `.claude.json.backup`. The script does not migrate them or install skills across agents.
 
 ## Starting from Downloads
 
@@ -71,7 +73,7 @@ Do not proceed if either command fails, if files changed during copying, if inve
 & $scriptPath -DriveLetter $driveLetter -Phase Status
 ```
 
-`Status` compares the manifest with disk: it reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, junctions that do not fit the recorded state, any recorded snapshot that is missing, outside `migration\rollbacks`, has a bad or duplicate path, lacks its hash, contains a junction or other reparse point, is unreadable, or no longer matches its recorded digest, plus orphaned `.incomplete-*` staging, orphaned `.restore-*` staging, stranded `<destination>.pre-restore-*` backups, unreferenced final snapshot folders, pending `.deleting-*` folders, and active or stale snapshot leases. Issues carry stable codes. Add `-Quick` to skip content hashing, `-AsJson` for a machine-readable report (`schema`, `generatedUtc`, `root`, `healthy`, `issueCount`, `issues`, `entries`, `inventory`), and `-Strict` to exit with code 2 when issues exist. Treat any reported issue as a blocker and reconcile it before continuing; a clean run prints `Status: manifest matches disk for the selected agents.`
+`Status` compares the manifest with disk: it reports a missing or redirected legacy junction, a missing hold, a missing or unavailable destination, junctions that do not fit the recorded state, any recorded snapshot that is missing, outside `migration\rollbacks`, has a bad or duplicate path, lacks its hash, contains a junction or other reparse point, is unreadable, or no longer matches its recorded digest, plus orphaned `.incomplete-*` staging, orphaned `.restore-*` staging, stranded `<destination>.pre-restore-*` backups, unreferenced final snapshot folders, pending `.deleting-*` folders, and active, stale or unreadable snapshot leases. A deletion seen during an active lease is reported separately as potentially in progress, not necessarily abandoned. Issues carry stable codes. Add `-Quick` to skip content hashing, `-AsJson` for a machine-readable report (`schema`, `generatedUtc`, `root`, `healthy`, `issueCount`, `issues`, `entries`, `inventory`), and `-Strict` to exit with code 2 when issues exist. Treat any reported issue as a blocker and reconcile it before continuing; a clean run prints `Status: manifest matches disk for the selected agents.`
 
 After the user has closed affected agents and the agent has verified they are stopped, run:
 
@@ -101,7 +103,7 @@ The manifest stores `destinationSnapshots` as records with `path`, `hash`, `byte
 
 ### Previewing moves and deletions
 
-Activate, Rollback, Cleanup, PruneSnapshots, AdoptSnapshots and RestoreSnapshot accept `-WhatIf`. A preview performs the same read-only checks and reports the planned rename, junction, backup, deletion, adoption or restore, but does not require the phase's approval switches: omit `-ConfirmAgentsStopped` and `-ApproveRollback` for Rollback, `-ConfirmAgentsValidated` and `-ApproveDeletion` for Cleanup, `-ApproveSnapshotDeletion` for PruneSnapshots, `-ApproveSnapshotAdoption` for AdoptSnapshots, and `-ConfirmAgentsStopped`/`-ApproveSnapshotRestore` for RestoreSnapshot. `-BackupRoot` is optional for a Cleanup preview. It changes no files and leaves the manifest untouched, so use it to show the user exactly what a phase would do before asking for approval.
+Activate, Rollback, Cleanup, PruneSnapshots, AdoptSnapshots, RestoreSnapshot and ReconcileRestore accept `-WhatIf`. A preview performs the same read-only checks and reports the planned rename, junction, backup, deletion, adoption or restore, but does not require the phase's approval switches: omit `-ConfirmAgentsStopped` and `-ApproveRollback` for Rollback, `-ConfirmAgentsValidated` and `-ApproveDeletion` for Cleanup, `-ApproveSnapshotDeletion` for PruneSnapshots, `-ApproveSnapshotAdoption` for AdoptSnapshots, `-ConfirmAgentsStopped`/`-ApproveSnapshotRestore` for RestoreSnapshot, and `-ConfirmAgentsStopped`/`-ApproveRestoreReconciliation` for ReconcileRestore. `-BackupRoot` is optional for a Cleanup preview. It changes no files and leaves the manifest untouched, so use it to show the user exactly what a phase would do before asking for approval. Inventory, Copy and Verify refuse `-WhatIf` without making changes.
 
 ### Snapshot maintenance
 
@@ -112,7 +114,7 @@ Snapshots accumulate deliberately and are never pruned automatically. Prune only
 & $scriptPath -DriveLetter $driveLetter -Phase PruneSnapshots -Agent claude -KeepLast 3 -ApproveSnapshotDeletion
 ```
 
-`-KeepLast N` and `-KeepDays N` select snapshots to retain; the current snapshot and any record marked `pinned` are always retained. Without `-WhatIf`, the phase requires `-ApproveSnapshotDeletion`. It renames each folder to `.deleting-*`, removes the record, and then deletes it; a later prune clears a pending folder left by a crash. It refuses paths outside `migration\rollbacks`.
+`-KeepLast N` and `-KeepDays N` select snapshots to retain; the current snapshot, pinned records, and paths referenced by another agent are retained. Without `-WhatIf`, the phase requires `-ApproveSnapshotDeletion`. A recovery record is written before each rename to `.deleting-*`. A later prune verifies and restores pending data and its history record before applying the current retention options; pending data for unselected agents remains untouched. Collisions, digest mismatches, pending folders without recovery records, and recovery records whose data is missing require manual reconciliation. Status reports the latter as `snapshot_recovery_pending`. It refuses paths outside `migration\rollbacks`.
 
 Use `AdoptSnapshots` to backfill a legacy string-valued history or adopt an orphaned final folder left by an interrupted rollback. Without `-WhatIf`, it requires `-ApproveSnapshotAdoption`:
 
@@ -123,7 +125,7 @@ Use `AdoptSnapshots` to backfill a legacy string-valued history or adopt an orph
 
 Adoption recomputes the digest, writes the sidecar and appends the record without changing the current `destinationSnapshot`. Use Status first; adopt only folders you recognize.
 
-`PruneSnapshots` and `AdoptSnapshots` acquire the same `.snapshot-lease.json` used by snapshot creation and restore. While one snapshot phase holds the lease, another snapshot phase is refused before it can change the manifest; the lease is released when the phase finishes or throws. Each phase reloads the manifest after acquiring the lease, so a phase that started earlier cannot overwrite records written by the one that finished first.
+All manifest-writing phases share a phase-wide lease. An exclusive handle on persistent `.snapshot-lease.lock` prevents cooperating processes from taking over while a phase runs; `.snapshot-lease.json` records the owner and may remain after a crash. A readable same-host lease is reclaimed only when its PID is no longer running, never merely because it is old. Investigate unreadable or remote-host leases manually, and do not delete or replace the lock file while commands may be running. Writers reload the manifest under the guard and check its hash before saving; this check is not atomic against outside writers that ignore the guard. Status can read a backup when the primary is unreadable, but writers refuse until the primary is reconciled. Writes flush a temporary file and replace the primary with a single-generation backup; this does not guarantee recovery from every power-loss or filesystem failure.
 
 Use `RestoreSnapshot` only when the user wants to replace one agent's current destination with a referenced snapshot. It verifies the recorded hash and, outside `-WhatIf`, requires `-ConfirmAgentsStopped` and `-ApproveSnapshotRestore`. It rejects any snapshot tree containing a junction or other reparse point before hashing or copying:
 
@@ -132,7 +134,7 @@ Use `RestoreSnapshot` only when the user wants to replace one agent's current de
 & $scriptPath -DriveLetter $driveLetter -Phase RestoreSnapshot -Agent claude -SnapshotPath 'D:\agents\migration\rollbacks\claude-20260101T000000000Z' -ConfirmAgentsStopped -ApproveSnapshotRestore
 ```
 
-Restore first creates a safety snapshot of the current destination, copies the chosen snapshot to staging, renames the current destination aside, moves staging into place, and verifies the result. If the final move or verification fails, it attempts to put the previous destination back. If the process is killed after the destination rename, Status reports the missing destination, the stranded `<destination>.pre-restore-*` backup, and any `.restore-*` staging; the next RestoreSnapshot refuses until those artifacts are reconciled. Rename a stranded backup back to the destination when the destination is missing, review it before removing a backup when the destination is present, and remove incomplete staging only after that review. It does not merge newer destination changes; review the safety snapshot and diff first.
+Restore first creates a safety snapshot of the current destination, copies the chosen snapshot to staging, renames the current destination aside, moves staging into place, and verifies the result. If the final move or verification fails, it attempts to put the previous destination back. If the process is killed after the destination rename, Status reports the missing destination, the stranded `<destination>.pre-restore-*` backup, and any `.restore-*` staging; the next RestoreSnapshot refuses until those artifacts are reconciled. After reviewing Status, preview `ReconcileRestore -Agent <agent> -WhatIf`; run it only after the user approves, with `-ConfirmAgentsStopped -ApproveRestoreReconciliation`. It restores a missing destination only when exactly one stranded backup exists and never replaces an existing destination. Other backups and staging move to `migration\restore-reconciliation` and remain there for review, without deletion. It refuses unsafe trees and ambiguous missing-destination cases. It does not merge newer destination changes; review the safety snapshot, preserved artifacts and diff first.
 
 ## Operational verification before cleanup
 
@@ -198,7 +200,9 @@ $linkScript = Join-Path $skillDirectory 'scripts\Link-SharedSkills.ps1'
 & $linkScript -DriveLetter $driveLetter -Apply    # create junctions
 ```
 
-Always run the report-only form first and read the `CONFIRMED` / `UNCONFIRMED` / `BLOCKED` table. Run the helper only after `Activate`, or use `-IncludeHome` for a dry run against unlinked homes. Never invent a skills path for an `UNCONFIRMED` agent: confirm the real location from that agent's own documentation, then pass it with `-IncludeHome` to see how it classifies before linking. Results are recorded in `<DRIVE>:\agents\registry\skill-links.json`.
+Always run the report-only form first and read the `CONFIRMED` / `UNCONFIRMED` / `BLOCKED` table. Run the helper only after `Activate`, or use `-IncludeHome` for a dry run against unlinked homes. Never invent a skills path for an `UNCONFIRMED` agent. An apply run writes the selected results to `<DRIVE>:\agents\registry\skill-links.json`; a link failure returns exit code 1. Read the failed skill and reason there before retrying, since earlier links may already exist.
+
+Defer `-Apply` until after planned Cleanup. The new skill junctions are reparse points inside the destination; Verify, Rollback and Cleanup will refuse those trees. Do not bypass the reparse checks to finish a migration.
 
 To exercise the linker without touching real agent directories, run the bundled scratch harness:
 
@@ -216,7 +220,7 @@ Never replace agent-private skills with shared copies based solely on matching n
 - Stop immediately on exceptions, mismatches, insufficient disk space, unexpected paths, or changed source data.
 - Do not rerun `Inventory` when a manifest exists; use `Status` and inspect state.
 - Do not manually remove `.incomplete-*`, `.deleting-*`, `.snapshot-lease.json` or snapshot folders. Use Status, AdoptSnapshots or PruneSnapshots so the manifest and disk stay consistent.
-- If RestoreSnapshot is interrupted after renaming the destination, do not rerun it blindly. Status reports the stranded `<destination>.pre-restore-*` backup and `.restore-*` staging. Rename the backup back when the destination is missing, review it before removing it when a destination is present, and remove incomplete staging only after that review.
+- If RestoreSnapshot is interrupted, do not rerun it blindly. Review Status, then use the explicitly approved ReconcileRestore phase or reconcile manually. It preserves staging and extra backups for review rather than deleting them.
 - Do not run RestoreSnapshot without a specific user request and a reviewed `-WhatIf`; it replaces the agent's current destination and creates a safety snapshot that must be retained until the result is accepted.
 - If a source was renamed but its junction was not created, restore the source only after checking that no newer data exists in the destination.
 - If the destination is unavailable, do not silently write new persistent data back to `C:`.

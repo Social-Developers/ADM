@@ -111,7 +111,7 @@ function New-ScratchVolume([string]$Path) {
     $script:scratchLetters += $letter
     return $letter
 }
-function Read-Manifest { return (Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json) }
+function Read-Manifest { return (Get-Content -LiteralPath $manifestPath -Encoding UTF8 -Raw | ConvertFrom-Json) }
 function Read-Entry([string]$Id) { return @((Read-Manifest).entries | Where-Object { $_.id -eq $Id })[0] }
 
 $runId = [guid]::NewGuid().ToString('N')
@@ -148,6 +148,33 @@ try {
     $pruneFailpointNeedle = 'Move-Item -LiteralPath $full -Destination $deleting -ErrorAction Stop'
     if (-not $crashText.Contains($pruneFailpointNeedle)) { throw 'Cannot install the prune crash failpoint.' }
     $crashText = $crashText.Replace($pruneFailpointNeedle, $pruneFailpointNeedle + "`n                if (`$env:ADM_TEST_FAILPOINT -eq 'AfterPruneRename') { [Environment]::Exit(97) }")
+    $pruneSaveNeedle = "Remove-SnapshotRecord `$e `$full`n                Save-Json `$manifest `$script:ManifestPath -Backup`n                Remove-Item -LiteralPath `$deleting"
+    $crashText = $crashText -replace "`r`n", "`n"
+    if (-not $crashText.Contains($pruneSaveNeedle)) { throw 'Cannot install the prune post-save crash failpoint.' }
+    $crashText = $crashText.Replace($pruneSaveNeedle, "Remove-SnapshotRecord `$e `$full`n                Save-Json `$manifest `$script:ManifestPath -Backup`n                if (`$env:ADM_TEST_FAILPOINT -eq 'AfterPruneManifest' -or (`$env:ADM_TEST_FAILPOINT -eq 'AfterSecondPruneManifest' -and `$i -eq 1)) { [Environment]::Exit(96) }`n                Remove-Item -LiteralPath `$deleting")
+    $recoveryNeedle = 'if ($hasPending) { Move-Item -LiteralPath $pendingPath -Destination $original -ErrorAction Stop }'
+    if (-not $crashText.Contains($recoveryNeedle)) { throw 'Cannot install the prune recovery crash failpoint.' }
+    $crashText = $crashText.Replace($recoveryNeedle, $recoveryNeedle + "`n            if (`$env:ADM_TEST_FAILPOINT -eq 'AfterRecoveryRename') { [Environment]::Exit(95) }")
+    $deleteNeedle = 'Remove-Item -LiteralPath $deleting -Recurse -Force -ErrorAction Stop'
+    if (-not $crashText.Contains($deleteNeedle)) { throw 'Cannot install the completed-delete crash failpoint.' }
+    $crashText = $crashText.Replace($deleteNeedle, $deleteNeedle + "`n                if (`$env:ADM_TEST_FAILPOINT -eq 'AfterPruneDelete') { [Environment]::Exit(94) }")
+    $reconcileNeedle = 'Move-Item -LiteralPath $item.FullName -Destination $preservedPath -ErrorAction Stop'
+    if (-not $crashText.Contains($reconcileNeedle)) { throw 'Cannot install the restore reconciliation crash failpoint.' }
+    $crashText = $crashText.Replace($reconcileNeedle, $reconcileNeedle + "`n                    if (`$env:ADM_TEST_FAILPOINT -eq 'AfterReconcilePreserve') { [Environment]::Exit(93) }")
+    $boundaryFailpoints = @(
+        @{ needle='Save-Json ([pscustomobject]@{ schema=1; agent=$e.id; path=$full; record=$record; index=$currentIndex }) $journalPath'; name='AfterPruneJournal'; code=92 },
+        @{ needle="Add-SnapshotHistoryRecord `$owner `$record`n            Save-Json `$manifest `$script:ManifestPath -Backup"; name='AfterAdoptManifest'; code=91 },
+        @{ needle="Add-SnapshotRecord `$e `$safety`n            Save-Json `$manifest `$script:ManifestPath -Backup"; name='AfterSafetyManifest'; code=90 },
+        @{ needle='Copy-Tree $target $staging'; name='AfterRestoreStaging'; code=89 },
+        @{ needle='Move-Item -LiteralPath $staging -Destination $e.destination -ErrorAction Stop'; name='AfterRestoreInstall'; code=88 },
+        @{ needle='Rename-Item -LiteralPath $e.hold -NewName ([IO.Path]::GetFileName($e.source)) -ErrorAction Stop'; name='AfterRollbackHoldRename'; code=87 }
+    )
+    foreach ($boundary in $boundaryFailpoints) {
+        $needle = [string]$boundary.needle
+        if (([regex]::Matches($crashText, [regex]::Escape($needle))).Count -ne 1) { throw "Cannot install unique crash failpoint: $($boundary.name)" }
+        $injection = "`n            if (`$env:ADM_TEST_FAILPOINT -eq '$($boundary.name)') { [Environment]::Exit($($boundary.code)) }"
+        $crashText = $crashText.Replace($needle, $needle + $injection)
+    }
     Set-Content -LiteralPath $crashScriptPath -Value $crashText
     Unblock-File -LiteralPath $crashScriptPath
 
@@ -165,6 +192,13 @@ try {
     Add-File (Join-Path $fakeHome '.claude\skills\demo\SKILL.md') '# demo'
     Add-File (Join-Path $fakeHome '.cursor\notes.txt') 'cursor notes'
     Add-File (Join-Path $fakeHome '.gemini\config.json') '{"model":"x"}'
+    Add-File (Join-Path $fakeHome '.codex\AGENTS.md') 'codex instructions'
+    Add-File (Join-Path $env:APPDATA 'opencode\agent\review.md') 'opencode instructions'
+    Add-File (Join-Path $fakeHome '.claude.json') 'standalone fixture'
+    $customRelative = '.config\agent ' + [char]0x96ea
+    $customHome = Join-Path $fakeHome $customRelative
+    Add-File (Join-Path $customHome 'agents\review[1].md') 'custom instructions'
+    $sourcesFile = Join-Path $runRoot 'additional sources.json'
 
     $claudeSource = Join-Path $fakeHome '.claude'
     $claudeHold = $claudeSource + '.qagents-migration-hold'
@@ -184,16 +218,53 @@ try {
     Write-Host '=== inventory ==='
     Write-Host ("scratch root : {0}" -f $runRoot)
     Write-Host ("volumes      : {0}: and {1}:" -f $rootLetter, $backupLetter)
-    $out = Invoke-Migrate @('-Phase', 'Inventory', '-DriveLetter', $rootLetter)
+    $inventoryArgs = @('-Phase', 'Inventory', '-DriveLetter', $rootLetter, '-AdditionalSourcesFile', $sourcesFile)
+    foreach ($case in @(
+        @{ id='extra'; path='..\outside'; error='Invalid profile path component' },
+        @{ id='codex'; path='.codex'; error='Duplicate agent id' },
+        @{ id='nul'; path='.codex'; error='Invalid additional agent id' },
+        @{ id='extra'; path='AppData\Roaming'; error='dedicated agent directory' },
+        @{ id='extra'; path='.claude\skills'; error='Overlapping agent directories' },
+        @{ id='extra'; path='.claude.json'; error='not an existing directory' }
+    )) {
+        [IO.File]::WriteAllText($sourcesFile, (ConvertTo-Json -InputObject @(@{id=$case.id; profilePath=$case.path})))
+        $out = Invoke-Migrate $inventoryArgs -ExpectFailure
+        Check-Text $out $case.error ("rejects extra source '{0}' for {1}" -f $case.path, $case.id)
+        Check (-not (Test-Path -LiteralPath $manifestPath)) 'invalid inventory leaves no manifest'
+    }
+    $extras = @(@{id='custom_agent'; profilePath=$customRelative}, @{id='extra_state'; profilePath='.local\state\extra'})
+    New-Item -ItemType Directory -Path (Join-Path $fakeHome $extras[1].profilePath) -Force | Out-Null
+    [IO.File]::WriteAllText($sourcesFile, (ConvertTo-Json -InputObject $extras))
+    $out = Invoke-Migrate $inventoryArgs
     Check (Test-Path -LiteralPath $manifestPath) 'inventory writes the manifest'
-    Check ((Read-Manifest).entries.Count -eq 3) 'inventory records all three agents'
+    Check ((Read-Manifest).entries.Count -eq 7) 'inventory records all five defaults and both configured homes'
+    Check ((Read-Entry 'custom_agent').source -ceq $customHome) 'inventory preserves the non-ASCII source path'
+    Check-Text $out 'Standalone file not migrated:' 'inventory reports the standalone Claude configuration file'
     Check ((Read-Entry 'claude').state -eq 'Inventoried') 'inventory marks claude Inventoried'
     Check (Test-Path -LiteralPath (Join-Path $runRoot 'root\agents\shared\skills')) 'inventory creates the skeleton'
     $out = Invoke-Migrate @('-Phase', 'Inventory', '-DriveLetter', $rootLetter) -ExpectFailure
     Check-Text $out 'Manifest already exists' 'inventory refuses to overwrite an existing manifest'
 
+    Remove-Item -LiteralPath $sourcesFile
+    foreach ($id in @('codex', 'opencode', 'custom_agent')) {
+        foreach ($phaseName in @('Copy', 'Verify')) {
+            $out = Invoke-Migrate @('-Phase', $phaseName, '-Agent', $id, '-DriveLetter', $rootLetter)
+        }
+        $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', $id, '-DriveLetter', $rootLetter, '-ConfirmAgentsStopped')
+        $entry = Read-Entry $id
+        Check ((Get-Item -LiteralPath $entry.source -Force).LinkType -eq 'Junction') "$id activates from the manifest alone"
+        if ($id -eq 'custom_agent') {
+            Check (([IO.File]::ReadAllText((Join-Path $entry.source 'agents\review[1].md'))).Trim() -ceq 'custom instructions') 'literal filename reads through the custom junction'
+        }
+        $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', $id, '-DriveLetter', $rootLetter, '-ConfirmAgentsStopped', '-ApproveRollback')
+        Check ((Read-Entry $id).state -eq 'Verified' -and -not (Test-Path -LiteralPath $entry.hold)) "$id rolls back to its original home"
+    }
+
     Write-Host ''
     Write-Host '=== copy ==='
+    $out = Invoke-Migrate @('-Phase', 'Copy', '-Agent', 'cursor', '-DriveLetter', $rootLetter, '-WhatIf') -ExpectFailure
+    Check-Text $out '-WhatIf is not supported' 'copy refuses an unsupported preview'
+    Check (-not (Test-Path -LiteralPath $cursorDest)) 'refused copy preview creates no destination'
     # Interrupted copy: a partial destination must not be overwritten.
     New-Item -ItemType Directory -Path $cursorDest -Force | Out-Null
     Add-File (Join-Path $cursorDest 'partial.txt') 'partial'
@@ -203,7 +274,14 @@ try {
     Check (Test-Path -LiteralPath (Join-Path $cursorDest 'partial.txt')) 'refused copy leaves the partial destination intact'
     Remove-Item -LiteralPath $cursorDest -Recurse -Force
 
-    $out = Invoke-Migrate @('-Phase', 'Copy', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    $copyMarker = Join-Path $root 'migration\rollbacks\.test-copy-ready'
+    $copyWindow = Start-Migrate -Arguments @('-Phase', 'Copy', '-Agent', 'claude', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'CopyBeforeManifest' }
+    Check (Wait-ForFile $copyMarker 30) 'copy pauses before updating the manifest'
+    $out = Invoke-Migrate @('-Phase', 'Copy', '-Agent', 'cursor', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Snapshot operation already in progress' 'another manifest writer refuses during copy'
+    Check ((Read-Entry 'cursor').state -eq 'Inventoried') 'contending copy leaves the other entry unchanged'
+    Set-Content -LiteralPath ($copyMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $copyWindow
     Check ((Read-Entry 'claude').state -eq 'Copied') 'copy records claude as Copied'
     $out = Invoke-Migrate @('-Phase', 'Copy', '-Agent', 'cursor', '-DriveLetter', $rootLetter)
     Check ((Read-Entry 'cursor').state -eq 'Copied') 'copy records cursor as Copied'
@@ -218,8 +296,29 @@ try {
     Check-Text $out 'SHA-256 mismatch' 'verify rejects a changed destination file'
     Check ((Read-Entry 'claude').state -eq 'Copied') 'failed verify leaves the state Copied'
     Set-Content -LiteralPath $claudeSettings -Value '{"theme":"dark"}'
-    $out = Invoke-Migrate @('-Phase', 'Verify', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    $verifyMarker = Join-Path $root 'migration\rollbacks\.test-after-lease'
+    $verifyWindow = Start-Migrate -Arguments @('-Phase', 'Verify', '-Agent', 'claude', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'AfterSnapshotLease' }
+    Check (Wait-ForFile $verifyMarker 30) 'verify holds the phase-wide guard'
+    $out = Invoke-Migrate @('-Phase', 'Verify', '-Agent', 'cursor', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Snapshot operation already in progress' 'second writer refuses while the guard is held'
+    $externalManifest = Read-Manifest
+    $externalManifest | Add-Member -NotePropertyName externalEdit -NotePropertyValue 'preserve' -Force
+    [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json -InputObject $externalManifest -Depth 20), (New-Object Text.UTF8Encoding($false)))
+    Set-Content -LiteralPath ($verifyMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $verifyWindow
     Check ((Read-Entry 'claude').state -eq 'Verified') 'verify records claude as Verified'
+    Check ((Read-Manifest).externalEdit -eq 'preserve') 'verify reloads changes made before acquiring its manifest'
+    $saveMarker = Join-Path $root 'migration\rollbacks\.test-state-save'
+    $saveWindow = Start-Migrate -Arguments @('-Phase', 'Verify', '-Agent', 'cursor', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'BeforeStateSave' }
+    Check (Wait-ForFile $saveMarker 30) 'verify pauses before saving its state'
+    $externalManifest = Read-Manifest
+    $externalManifest.externalEdit = 'newer'
+    [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json -InputObject $externalManifest -Depth 20), (New-Object Text.UTF8Encoding($false)))
+    Set-Content -LiteralPath ($saveMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $saveWindow -ExpectFailure
+    Check-Text $out 'Manifest changed after it was loaded' 'verify refuses to overwrite an external change'
+    Check ((Read-Manifest).externalEdit -eq 'newer') 'refused save preserves the external change'
+    Check ((Read-Entry 'cursor').state -eq 'Copied') 'refused save preserves the prior cursor state'
     Check (Test-Path -LiteralPath ($manifestPath + '.bak')) 'manifest updates keep a backup copy'
     $out = Invoke-Migrate @('-Phase', 'Verify', '-Agent', 'cursor', '-DriveLetter', $rootLetter)
     Check ((Read-Entry 'cursor').state -eq 'Verified') 'verify records cursor as Verified'
@@ -279,10 +378,17 @@ try {
     Add-File (Join-Path $activeStaging 'partial.txt') 'partial'
     $leasePath = Join-Path $root 'migration\rollbacks\.snapshot-lease.json'
     $lease = [pscustomobject]@{ pid = $PID; host = [Environment]::MachineName; agent = 'claude'; startedUtc = [DateTime]::UtcNow.ToString('o'); staging = $activeStaging; snapshot = '' }
+    $lease.startedUtc = [DateTime]::UtcNow.AddDays(-2).ToString('o')
     $lease | ConvertTo-Json | Set-Content -LiteralPath $leasePath
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
-    Check-Text $out 'Snapshot operation in progress' 'status reports an active snapshot operation'
+    Check-Text $out 'Snapshot operation in progress' 'status reports an old lease owned by a live process as active'
     Check (-not $out.Contains('.incomplete-claude-active')) 'status does not call active staging orphaned'
+    $activeDeletion = Join-Path $root 'migration\rollbacks\.deleting-claude-active'
+    Add-File (Join-Path $activeDeletion 'pending.txt') 'pending'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter, '-AsJson')
+    $activeJson = $out | ConvertFrom-Json
+    Check (@($activeJson.issues | Where-Object { $_.code -eq 'snapshot_delete_active' }).Count -eq 1) 'status distinguishes deletion during an active phase'
+    Remove-Item -LiteralPath $activeDeletion -Recurse -Force
     $historyBefore = 0
     $historyProperty = (Read-Entry 'claude').PSObject.Properties['destinationSnapshots']
     if ($null -ne $historyProperty) { $historyBefore = @($historyProperty.Value).Count }
@@ -291,6 +397,8 @@ try {
     $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter) -ExpectFailure
     Check-Text $out 'Snapshot operation already in progress' 'adopt refuses while another snapshot phase is active'
     Check (Test-Path -LiteralPath $leasePath) 'refused snapshot phases leave the active lease in place'
+    $out = Invoke-Migrate @('-Phase', 'Verify', '-Agent', 'claude', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Snapshot operation already in progress' 'manifest writer refuses the old live lease'
     $historyAfter = 0
     $historyProperty = (Read-Entry 'claude').PSObject.Properties['destinationSnapshots']
     if ($null -ne $historyProperty) { $historyAfter = @($historyProperty.Value).Count }
@@ -300,6 +408,21 @@ try {
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'Stale snapshot operation lease' 'status reports a stale snapshot lease'
     Check-Text $out 'Orphaned snapshot staging' 'stale lease leaves staging orphaned'
+    $takeoverMarker = Join-Path $root 'migration\rollbacks\.test-after-lease'
+    $takeover = Start-Migrate -Arguments @('-Phase', 'Verify', '-Agent', 'claude', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'AfterSnapshotLease' }
+    Check (Wait-ForFile $takeoverMarker 30) 'first contender takes over the stale lease'
+    Remove-Item -LiteralPath $leasePath -Force
+    $out = Invoke-Migrate @('-Phase', 'Verify', '-Agent', 'cursor', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'lease guard held' 'second contender cannot enter after the lease file is removed'
+    Set-Content -LiteralPath ($takeoverMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $takeover
+    Check (-not (Test-Path -LiteralPath $leasePath)) 'takeover releases its own lease'
+    Set-Content -LiteralPath $leasePath -Value 'not json'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Unreadable snapshot operation lease' 'status reports an unreadable lease'
+    $out = Invoke-Migrate @('-Phase', 'Verify', '-Agent', 'claude', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Snapshot lease is unreadable' 'writer refuses an unreadable lease'
+    Check (Test-Path -LiteralPath $leasePath) 'writer preserves an unreadable lease for review'
     Remove-Item -LiteralPath $leasePath -Force
     Remove-Item -LiteralPath $activeStaging -Recurse -Force
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
@@ -577,6 +700,31 @@ try {
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'manifest matches disk' 'status agrees after pruning'
 
+    # A recovery record written before the rename must not orphan or delete the snapshot.
+    $journalCrash = Join-Path $rollbacksRoot 'claude-20170101T000000000Z'
+    Add-File (Join-Path $journalCrash 'journal-data.txt') 'journal crash data'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $journalCrash, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    $savedFailpoint = $env:ADM_TEST_FAILPOINT
+    $env:ADM_TEST_FAILPOINT = 'AfterPruneJournal'
+    try {
+        $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode 92 -UseScript $crashScriptPath
+    } finally {
+        if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+    }
+    $journals = @(Get-ChildItem -LiteralPath $rollbacksRoot -File -Force -Filter '.deleting-*.recovery.json')
+    Check ($journals.Count -eq 1) 'prune journal crash leaves one recovery record'
+    Check (Test-Path -LiteralPath (Join-Path $journalCrash 'journal-data.txt')) 'prune journal crash leaves the original bytes'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $journalCrash }).Count -eq 1) 'prune journal crash leaves the manifest record'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter, '-AsJson')
+    $json = $out | ConvertFrom-Json
+    Check (@($json.issues | Where-Object { $_.code -eq 'snapshot_recovery_pending' }).Count -eq 1) 'status reports the pre-rename journal'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '2', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+    Check (Test-Path -LiteralPath (Join-Path $journalCrash 'journal-data.txt')) 'prune journal recovery retains protected bytes'
+    Check (-not (Test-Path -LiteralPath $journals[0].FullName)) 'prune journal recovery clears the record'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $journalCrash }).Count -eq 1) 'prune journal recovery keeps exactly one history record'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+    Check (-not (Test-Path -LiteralPath $journalCrash)) 'reviewed journal snapshot can be pruned afterward'
+
     # A crash after moving a pruned snapshot aside but before the manifest update.
     $pruneCrash = Join-Path $rollbacksRoot 'claude-20200101T000000000Z'
     Add-File (Join-Path $pruneCrash 'pending-delete.txt') 'pending deletion'
@@ -597,13 +745,189 @@ try {
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'Pending snapshot deletion under' 'status reports the pending deletion'
     Check-Text $out $pendingDeletions[0].Name 'status names the pending deletion folder'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'cursor', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+    Check (Test-Path -LiteralPath $pendingDeletions[0].FullName) 'prune for another agent leaves pending data untouched'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $pruneCrash }).Count -eq 1) 'prune for another agent preserves the pending record'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '2', '-DriveLetter', $rootLetter, '-WhatIf')
+    Check-Text $out 'would reconcile pending snapshot' 'prune preview reports recovery'
+    Check (Test-Path -LiteralPath $pendingDeletions[0].FullName) 'prune preview keeps pending data'
+    Check (-not (Test-Path -LiteralPath $pruneCrash)) 'prune preview does not restore pending data'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '2', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+    Check (Test-Path -LiteralPath (Join-Path $pruneCrash 'pending-delete.txt')) 'KeepLast recovery restores the protected snapshot'
+    Check (-not (Test-Path -LiteralPath $pendingDeletions[0].FullName)) 'KeepLast recovery moves pending data back'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $pruneCrash }).Count -eq 1) 'KeepLast recovery retains the record'
     $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
-    Check (-not (Test-Path -LiteralPath $pendingDeletions[0].FullName)) 'recovery prune removes the pending deletion folder'
-    Check ((Read-Entry 'claude').destinationSnapshots.Count -eq 1) 'recovery prune reconciles the snapshot history'
+    Check (-not (Test-Path -LiteralPath $pruneCrash)) 'later prune removes the unprotected snapshot'
+    Check (-not (Test-Path -LiteralPath ($pruneCrash + '.snapshot.json'))) 'later prune removes the snapshot sidecar'
+    Check ((Read-Entry 'claude').destinationSnapshots.Count -eq 1) 'later prune reconciles the snapshot history'
     Check (Test-Path -LiteralPath $removedEntry.destinationSnapshot) 'recovery prune keeps the latest snapshot'
     Check (-not (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json'))) 'recovery prune releases its lease'
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'manifest matches disk' 'status agrees after the prune crash recovery'
+
+    $pruneSavedCrash = Join-Path $rollbacksRoot 'claude-20200101T000001000Z'
+    Add-File (Join-Path $pruneSavedCrash 'pending-delete.txt') 'pending deletion after save'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $pruneSavedCrash, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    $savedFailpoint = $env:ADM_TEST_FAILPOINT
+    $env:ADM_TEST_FAILPOINT = 'AfterPruneManifest'
+    try {
+        $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode 96 -UseScript $crashScriptPath
+    } finally {
+        if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+    }
+    $pendingSaved = @(Get-ChildItem -LiteralPath $rollbacksRoot -Directory -Force -Filter '.deleting-*')
+    Check ($pendingSaved.Count -eq 1) 'post-save prune crash leaves pending deletion'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $pruneSavedCrash }).Count -eq 0) 'post-save prune crash leaves history updated'
+    Check (-not (Test-Path -LiteralPath ($pruneSavedCrash + '.snapshot.json'))) 'post-save prune crash leaves no orphan sidecar'
+    $savedFailpoint = $env:ADM_TEST_FAILPOINT
+    $env:ADM_TEST_FAILPOINT = 'AfterRecoveryRename'
+    try {
+        $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '2', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode 95 -UseScript $crashScriptPath
+    } finally {
+        if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+    }
+    Check (Test-Path -LiteralPath (Join-Path $pruneSavedCrash 'pending-delete.txt')) 'recovery crash leaves restored data intact'
+    Check (Test-Path -LiteralPath ($pendingSaved[0].FullName + '.recovery.json')) 'recovery crash retains its recovery record'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $pruneSavedCrash }).Count -eq 0) 'recovery crash occurs before restoring history'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '2', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+    Check (-not (Test-Path -LiteralPath $pendingSaved[0].FullName)) 'post-save recovery moves pending data back'
+    Check (Test-Path -LiteralPath (Join-Path $pruneSavedCrash 'pending-delete.txt')) 'post-save recovery restores data protected by KeepLast'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $pruneSavedCrash }).Count -eq 1) 'post-save recovery restores the history record'
+    Check (Test-Path -LiteralPath ($pruneSavedCrash + '.snapshot.json')) 'post-save recovery restores the sidecar'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+    Check (-not (Test-Path -LiteralPath $pruneSavedCrash)) 'later prune removes the post-save snapshot under the original policy'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status agrees after post-save prune recovery'
+
+    # Recovery must preserve history order after an earlier record was pruned in the same phase.
+    $orderA = Join-Path $rollbacksRoot 'claude-20180101T000001000Z'
+    $orderB = Join-Path $rollbacksRoot 'claude-20180101T000002000Z'
+    $orderC = Join-Path $rollbacksRoot 'claude-20180101T000003000Z'
+    foreach ($path in @($orderA, $orderB, $orderC)) {
+        Add-File (Join-Path $path 'order.txt') $path
+        $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $path, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    }
+    $orderedManifest = Read-Manifest
+    $orderedEntry = @($orderedManifest.entries | Where-Object { $_.id -eq 'claude' })[0]
+    $latestRecord = @($orderedEntry.destinationSnapshots | Where-Object { $_.path -eq $orderedEntry.destinationSnapshot })[0]
+    $orderedEntry.destinationSnapshots = @(@($orderedEntry.destinationSnapshots | Where-Object { $_.path -ne $orderedEntry.destinationSnapshot }) + @($latestRecord))
+    [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json -InputObject $orderedManifest -Depth 20), (New-Object Text.UTF8Encoding($false)))
+    $savedFailpoint = $env:ADM_TEST_FAILPOINT
+    $env:ADM_TEST_FAILPOINT = 'AfterSecondPruneManifest'
+    try {
+        $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '2', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode 96 -UseScript $crashScriptPath
+    } finally {
+        if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+    }
+    Check (-not (Test-Path -LiteralPath $orderA)) 'first snapshot is pruned before the second crash'
+    Check (Test-Path -LiteralPath $orderC) 'newer snapshot remains before recovery'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '2', '-DriveLetter', $rootLetter, '-WhatIf')
+    Check ($out.Contains($orderB) -and $out.Contains('would prune snapshot after reconciliation')) 'recovery preview includes the older pending snapshot in pruning'
+    Check (-not $out.Contains(('would prune snapshot after reconciliation: ' + $orderC))) 'recovery preview retains the newer snapshot'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '2', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+    Check (-not (Test-Path -LiteralPath $orderB)) 'recovery prunes the older pending snapshot'
+    Check (Test-Path -LiteralPath $orderC) 'recovery retains the newer snapshot under KeepLast'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+    Check (-not (Test-Path -LiteralPath $orderC)) 'older retained snapshot can be pruned under KeepDays'
+
+    $deletedCrash = Join-Path $rollbacksRoot 'claude-20190101T000000000Z'
+    Add-File (Join-Path $deletedCrash 'payload.txt') 'already deleted'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $deletedCrash, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    $savedFailpoint = $env:ADM_TEST_FAILPOINT
+    $env:ADM_TEST_FAILPOINT = 'AfterPruneDelete'
+    try {
+        $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode 94 -UseScript $crashScriptPath
+    } finally {
+        if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+    }
+    Check (-not (Test-Path -LiteralPath $deletedCrash)) 'post-delete crash leaves the original absent'
+    $orphanRecovery = @(Get-ChildItem -LiteralPath $rollbacksRoot -File -Force -Filter '.deleting-*.recovery.json')
+    Check ($orphanRecovery.Count -eq 1) 'post-delete crash leaves a recovery record'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter, '-AsJson')
+    $orphanStatus = $out | ConvertFrom-Json
+    Check (@($orphanStatus.issues | Where-Object { $_.code -eq 'snapshot_recovery_pending' }).Count -eq 1) 'status reports a recovery record without pending data'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '2', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'both missing' 'prune refuses to infer a completed deletion from missing data'
+    Check (Test-Path -LiteralPath $orphanRecovery[0].FullName) 'prune preserves the ambiguous recovery record'
+    Remove-Item -LiteralPath $orphanRecovery[0].FullName -Force
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status agrees after reviewing the completed deletion'
+
+    # Changing protection after a crash must preserve the original snapshot bytes.
+    $caseNumber = 2
+    foreach ($case in @('pinned', 'current', 'days', 'cross-agent', 'collision', 'tampered')) {
+        $casePath = Join-Path $rollbacksRoot ('claude-20200101T00000' + $caseNumber + '000Z')
+        $caseNumber++
+        Add-File (Join-Path $casePath 'payload.txt') $case
+        $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $casePath, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+        $savedFailpoint = $env:ADM_TEST_FAILPOINT
+        $env:ADM_TEST_FAILPOINT = 'AfterPruneRename'
+        try {
+            $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode 97 -UseScript $crashScriptPath
+        } finally {
+            if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+        }
+        $casePending = @(Get-ChildItem -LiteralPath $rollbacksRoot -Directory -Force -Filter '.deleting-*')[0].FullName
+        $caseManifest = Read-Manifest
+        $caseOwner = @($caseManifest.entries | Where-Object { $_.id -eq 'claude' })[0]
+        $caseRecord = @($caseOwner.destinationSnapshots | Where-Object { $_.path -eq $casePath })[0]
+        $priorLatest = $caseOwner.destinationSnapshot
+        $priorHash = $caseOwner.destinationSnapshotHash
+        $priorVersion = $caseOwner.destinationSnapshotDigestVersion
+        if ($case -eq 'pinned') { $caseRecord.pinned = $true }
+        if ($case -eq 'current') {
+            $caseOwner.destinationSnapshot = $casePath
+            $caseOwner.destinationSnapshotHash = $caseRecord.hash
+            $caseOwner.destinationSnapshotDigestVersion = $caseRecord.digestVersion
+        }
+        if ($case -eq 'days') { $caseRecord.createdUtc = [DateTime]::UtcNow.ToString('o') }
+        if ($case -eq 'cross-agent') {
+            $otherEntry = @($caseManifest.entries | Where-Object { $_.id -eq 'cursor' })[0]
+            $otherEntry | Add-Member -NotePropertyName destinationSnapshots -NotePropertyValue @($caseRecord) -Force
+        }
+        [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json -InputObject $caseManifest -Depth 20), (New-Object Text.UTF8Encoding($false)))
+        if ($case -eq 'collision') { Add-File (Join-Path $casePath 'collision.txt') 'unrelated' }
+        if ($case -eq 'tampered') { Add-File (Join-Path $casePending 'payload.txt') 'unexpected alteration' }
+        $expectRefusal = $case -in @('collision', 'tampered')
+        $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure:$expectRefusal
+        if ($expectRefusal) {
+            Check (Test-Path -LiteralPath $casePending) "$case recovery preserves pending data on refusal"
+            if ($case -eq 'collision') {
+                Check-Text $out 'Both pending and original snapshot exist' 'recovery refuses a path collision'
+                Remove-Item -LiteralPath $casePath -Recurse -Force
+            } else {
+                Check-Text $out 'Pending snapshot digest does not match' 'recovery refuses a tampered pending snapshot'
+                Set-Content -LiteralPath (Join-Path $casePending 'payload.txt') -Value $case
+            }
+            $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '2', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+        }
+        Check (Test-Path -LiteralPath (Join-Path $casePath 'payload.txt')) "$case recovery preserves snapshot bytes"
+        Check (-not (Test-Path -LiteralPath $casePending)) "$case recovery clears pending staging"
+        Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $casePath }).Count -eq 1) "$case recovery retains the snapshot record"
+        $caseManifest = Read-Manifest
+        $caseOwner = @($caseManifest.entries | Where-Object { $_.id -eq 'claude' })[0]
+        $caseRecord = @($caseOwner.destinationSnapshots | Where-Object { $_.path -eq $casePath })[0]
+        $caseRecord.pinned = $false
+        $caseRecord.createdUtc = '2020-01-01T00:00:00Z'
+        if ($case -eq 'current') {
+            $caseOwner.destinationSnapshot = $priorLatest
+            $caseOwner.destinationSnapshotHash = $priorHash
+            $caseOwner.destinationSnapshotDigestVersion = $priorVersion
+        }
+        if ($case -eq 'cross-agent') {
+            $otherEntry = @($caseManifest.entries | Where-Object { $_.id -eq 'cursor' })[0]
+            $otherEntry.destinationSnapshots = @()
+        }
+        [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json -InputObject $caseManifest -Depth 20), (New-Object Text.UTF8Encoding($false)))
+        $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+        Check (-not (Test-Path -LiteralPath $casePath)) "$case snapshot is pruned only after protection is removed"
+    }
+    $legacyPending = Join-Path $rollbacksRoot '.deleting-claude-legacy'
+    Add-File (Join-Path $legacyPending 'unknown.txt') 'unknown pending data'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'no recovery record' 'legacy pending deletion requires manual reconciliation'
+    Check (Test-Path -LiteralPath (Join-Path $legacyPending 'unknown.txt')) 'legacy pending data is preserved'
+    Remove-Item -LiteralPath $legacyPending -Recurse -Force
 
     Set-Content -LiteralPath $claudeSettings -Value '{"theme":"dark"}'
     $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
@@ -625,8 +949,17 @@ try {
     # A phase paused after loading the manifest must reload it before writing.
     $staleAdoption = Join-Path $rollbacksRoot 'claude-20260101T000001000Z'
     Add-File (Join-Path $staleAdoption 'adopted.txt') 'adopted'
-    Set-Content -LiteralPath $claudeSettings -Value '{"theme":"stale-window"}'
     $staleMarker = Join-Path $rollbacksRoot '.test-before-lease'
+    $staleVerify = Start-Migrate -Arguments @('-Phase', 'Verify', '-Agent', 'claude', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'BeforeSnapshotLease' }
+    Check (Wait-ForFile $staleMarker 30) 'verify pauses after loading the manifest'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $staleAdoption, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Adopted snapshot' 'adoption completes while verify is paused'
+    Set-Content -LiteralPath ($staleMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $staleVerify
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $staleAdoption }).Count -eq 1) 'verify reload preserves the newer adoption'
+    $staleAdoption = Join-Path $rollbacksRoot 'claude-20260101T000006000Z'
+    Add-File (Join-Path $staleAdoption 'adopted.txt') 'adopted'
+    Set-Content -LiteralPath $claudeSettings -Value '{"theme":"stale-window"}'
     $staleRollback = Start-Migrate -Arguments @('-Phase', 'Rollback', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRollback', '-AcceptDestinationChanges', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'BeforeSnapshotLease' }
     $markerAppeared = Wait-ForFile $staleMarker 30
     Check $markerAppeared 'rollback pauses after loading the manifest'
@@ -639,8 +972,16 @@ try {
     Check ($afterStale.state -eq 'Verified') 'paused rollback completes after adopting'
     Check (@($afterStale.destinationSnapshots | Where-Object { $_.path -eq $staleAdoption }).Count -eq 1) 'rollback reload preserves the newer adoption'
     Set-Content -LiteralPath $claudeSettings -Value '{"theme":"dark"}'
-    $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
+    $activateAdoption = Join-Path $rollbacksRoot 'claude-20260101T000007000Z'
+    Add-File (Join-Path $activateAdoption 'activate-window.txt') 'adopted during activate'
+    $staleActivate = Start-Migrate -Arguments @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'BeforeSnapshotLease' }
+    Check (Wait-ForFile $staleMarker 30) 'activate pauses after loading the manifest'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $activateAdoption, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Adopted snapshot' 'adoption completes while activate is paused'
+    Set-Content -LiteralPath ($staleMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $staleActivate
     Check ((Read-Entry 'claude').state -eq 'Activated') 'claude reactivates after the stale-manifest regression'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $activateAdoption }).Count -eq 1) 'activate state save preserves the newer adoption'
 
     # Adoption must reload after its lease, preserving a prune that completed first.
     $staleAdoption2 = Join-Path $rollbacksRoot 'claude-20260101T000002000Z'
@@ -649,8 +990,11 @@ try {
     $markerAppeared = Wait-ForFile $staleMarker 30
     Check $markerAppeared 'adoption pauses after loading the manifest'
     $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepLast', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
-    Check ((Read-Entry 'claude').destinationSnapshots.Count -eq 1) 'prune completes while adoption is paused'
-    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $staleAdoption }).Count -eq 0) 'prune removes the earlier adopted snapshot'
+    $afterConcurrentPrune = Read-Entry 'claude'
+    Check (@($afterConcurrentPrune.destinationSnapshots).Count -eq 2) 'prune keeps the current snapshot and the newest adopted snapshot'
+    Check (@($afterConcurrentPrune.destinationSnapshots | Where-Object { $_.path -eq $activateAdoption }).Count -eq 1) 'prune retains the newest adoption under KeepLast'
+    Check (@($afterConcurrentPrune.destinationSnapshots | Where-Object { $_.path -eq $afterConcurrentPrune.destinationSnapshot }).Count -eq 1) 'prune retains the current snapshot'
+    Check (@($afterConcurrentPrune.destinationSnapshots | Where-Object { $_.path -eq $staleAdoption }).Count -eq 0) 'prune removes the earlier adopted snapshot'
     Set-Content -LiteralPath ($staleMarker + '.release') -Value 'release'
     $out = Complete-Migrate -Handle $adoptWindow
     $afterAdoptReload = Read-Entry 'claude'
@@ -690,6 +1034,43 @@ try {
     New-Item -ItemType Junction -Path $claudeSource -Target $claudeDest | Out-Null
     Check ((Read-Entry 'claude').state -eq 'Activated') 'failed rollback leaves claude Activated'
 
+    # Rollback can restore the hold before its final manifest state is saved.
+    $rollbackBoundaryMarker = Join-Path $cursorDest 'rollback-boundary.txt'
+    Add-File $rollbackBoundaryMarker 'new destination data'
+    $cursorKnownBeforeCrash = @()
+    $cursorBeforeCrash = Read-Entry 'cursor'
+    if ($null -ne $cursorBeforeCrash.PSObject.Properties['destinationSnapshots']) { $cursorKnownBeforeCrash = @($cursorBeforeCrash.destinationSnapshots | ForEach-Object { $_.path }) }
+    $savedFailpoint = $env:ADM_TEST_FAILPOINT
+    $env:ADM_TEST_FAILPOINT = 'AfterRollbackHoldRename'
+    try {
+        $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-ApproveRollback', '-AcceptDestinationChanges', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode 87 -UseScript $crashScriptPath
+    } finally {
+        if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+    }
+    Check (Test-Path -LiteralPath (Join-Path $cursorSource 'notes.txt')) 'rollback boundary crash restores original source bytes'
+    Check (Test-Path -LiteralPath $rollbackBoundaryMarker) 'rollback boundary crash preserves destination changes'
+    Check (-not (Test-Path -LiteralPath $cursorHold)) 'rollback boundary crash occurs after the hold rename'
+    Check ((Read-Entry 'cursor').state -eq 'Activated') 'rollback boundary crash leaves manifest state unchanged'
+    $cursorUnreferenced = @(Get-ChildItem -LiteralPath $rollbacksRoot -Directory -Force | Where-Object { $_.Name -like 'cursor-*' -and $cursorKnownBeforeCrash -notcontains $_.FullName })
+    Check ($cursorUnreferenced.Count -eq 1) 'rollback boundary crash leaves one unreferenced snapshot'
+    Check (Test-Path -LiteralPath (Join-Path $cursorUnreferenced[0].FullName 'rollback-boundary.txt')) 'rollback boundary snapshot preserves changed bytes'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'cursor', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Unreferenced destination snapshot folder' 'status reports the rollback boundary snapshot'
+    Check-Text $out 'hold missing' 'status reports the rollback boundary state mismatch'
+    $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-ApproveRollback', '-AcceptDestinationChanges', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Hold missing' 'rollback retry refuses a restored hold'
+    Check (Test-Path -LiteralPath $rollbackBoundaryMarker) 'refused rollback retry leaves changed destination bytes'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'cursor', '-SnapshotPath', $cursorUnreferenced[0].FullName, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Adopted snapshot' 'rollback boundary snapshot can be adopted'
+    Check (@((Read-Entry 'cursor').destinationSnapshots | Where-Object { $_.path -eq $cursorUnreferenced[0].FullName }).Count -eq 1) 'rollback boundary adoption records the snapshot once'
+    Check (Test-Path -LiteralPath (Join-Path $cursorUnreferenced[0].FullName 'rollback-boundary.txt')) 'adoption retains rollback boundary snapshot bytes'
+    # Restore the scratch fixture to its prior activated state for the existing lifecycle tests.
+    Rename-Item -LiteralPath $cursorSource -NewName (Split-Path $cursorHold -Leaf)
+    New-Item -ItemType Junction -Path $cursorSource -Target $cursorDest | Out-Null
+    Remove-Item -LiteralPath $rollbackBoundaryMarker -Force
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'cursor', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status agrees after reconciling the scratch rollback state'
+
     # Successful rollback: restore the hold, remove only the junction, keep the destination.
     $out = Invoke-Migrate @('-Phase', 'Rollback', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-ApproveRollback', '-DriveLetter', $rootLetter)
     Check (-not (Test-Path -LiteralPath $cursorHold)) 'rollback renames the hold back'
@@ -699,7 +1080,7 @@ try {
     Check (Test-Path -LiteralPath (Join-Path $cursorDest 'notes.txt')) 'rollback leaves the destination in place'
     Check ((Read-Entry 'cursor').state -eq 'Verified') 'rollback returns the entry to Verified'
     Check (-not [string]::IsNullOrWhiteSpace((Read-Entry 'cursor').rolledBackUtc)) 'rollback records when it happened'
-    Check ($null -eq (Read-Entry 'cursor').PSObject.Properties['destinationSnapshot']) 'unchanged rollback creates no snapshot'
+    Check ($null -eq (Read-Entry 'cursor').PSObject.Properties['destinationSnapshot']) 'unchanged rollback creates no current snapshot'
 
     # Half-rollback: junction already gone, hold still present, state still Activated.
     $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'cursor', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
@@ -722,7 +1103,10 @@ try {
     } finally {
         if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
     }
-    $knownPaths = @((Read-Entry 'claude').destinationSnapshots | ForEach-Object { $_.path })
+    $knownPaths = @((Read-Manifest).entries | ForEach-Object {
+        $property = $_.PSObject.Properties['destinationSnapshots']
+        if ($null -ne $property) { @($property.Value) | ForEach-Object { $_.path } }
+    })
     $crashSnapshots = @(Get-ChildItem -LiteralPath $rollbacksRoot -Directory -Force | Where-Object { $_.Name -notlike '.*' -and $knownPaths -notcontains $_.FullName })
     Check ($crashSnapshots.Count -eq 1) 'crash leaves exactly one unreferenced snapshot'
     $crashSnapshot = $crashSnapshots[0].FullName
@@ -753,6 +1137,85 @@ try {
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'manifest matches disk' 'status agrees after removing the crash change'
 
+    # Adoption can save its history record before writing the optional sidecar.
+    $adoptCrash = Join-Path $rollbacksRoot 'claude-20160101T000000000Z'
+    Add-File (Join-Path $adoptCrash 'adoption-data.txt') 'adoption crash data'
+    $savedFailpoint = $env:ADM_TEST_FAILPOINT
+    $env:ADM_TEST_FAILPOINT = 'AfterAdoptManifest'
+    try {
+        $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $adoptCrash, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode 91 -UseScript $crashScriptPath
+    } finally {
+        if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+    }
+    Check (Test-Path -LiteralPath (Join-Path $adoptCrash 'adoption-data.txt')) 'adoption manifest crash retains snapshot bytes'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $adoptCrash }).Count -eq 1) 'adoption manifest crash records the snapshot once'
+    Check (-not (Test-Path -LiteralPath ($adoptCrash + '.snapshot.json'))) 'adoption manifest crash precedes sidecar creation'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Stale snapshot operation lease' 'status reports the adoption crash lease'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $adoptCrash, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'not an unreferenced folder' 'adoption retry refuses a duplicate record'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $adoptCrash }).Count -eq 1) 'adoption retry retains one record'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status accepts the adopted snapshot without a sidecar'
+
+    # Check restore boundaries before and after the final destination rename.
+    foreach ($boundary in @(
+        @{name='AfterSafetyManifest'; code=90},
+        @{name='AfterRestoreStaging'; code=89},
+        @{name='AfterRestoreInstall'; code=88}
+    )) {
+        $boundaryName = [string]$boundary.name
+        $boundaryMarker = Join-Path $claudeDest 'pre-restore-boundary.txt'
+        Add-File $boundaryMarker $boundaryName
+        $priorSnapshotPaths = @((Read-Entry 'claude').destinationSnapshots | ForEach-Object { $_.path })
+        $savedFailpoint = $env:ADM_TEST_FAILPOINT
+        $env:ADM_TEST_FAILPOINT = $boundaryName
+        try {
+            $out = Invoke-Migrate @('-Phase', 'RestoreSnapshot', '-Agent', 'claude', '-SnapshotPath', $crashSnapshot, '-ConfirmAgentsStopped', '-ApproveSnapshotRestore', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode $boundary.code -UseScript $crashScriptPath
+        } finally {
+            if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+        }
+        $afterBoundary = Read-Entry 'claude'
+        $safetyPath = $afterBoundary.destinationSnapshot
+        Check ($priorSnapshotPaths -notcontains $safetyPath) "$boundaryName records a new safety snapshot"
+        Check (Test-Path -LiteralPath (Join-Path $safetyPath 'pre-restore-boundary.txt')) "$boundaryName safety snapshot preserves destination bytes"
+        Check (@($afterBoundary.destinationSnapshots | Where-Object { $_.path -eq $safetyPath }).Count -eq 1) "$boundaryName records the safety snapshot once"
+        Check (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json')) "$boundaryName leaves a crash lease"
+        $boundaryStages = @(Get-ChildItem -LiteralPath $rollbacksRoot -Directory -Force -Filter '.restore-claude-*')
+        $boundaryBackups = @(Get-ChildItem -LiteralPath (Split-Path $claudeDest -Parent) -Directory -Force | Where-Object { $_.Name -like ((Split-Path $claudeDest -Leaf) + '.pre-restore-*') })
+        if ($boundaryName -eq 'AfterSafetyManifest') {
+            Check (Test-Path -LiteralPath $boundaryMarker) 'safety-save crash leaves current destination bytes'
+            Check ($boundaryStages.Count -eq 0 -and $boundaryBackups.Count -eq 0) 'safety-save crash occurs before destination staging'
+            $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter) -ExpectFailure
+            Check-Text $out 'No restore artifacts to reconcile' 'reconciliation refuses when the destination needs no recovery'
+            Check (Test-Path -LiteralPath $boundaryMarker) 'refused reconciliation leaves destination bytes'
+        } elseif ($boundaryName -eq 'AfterRestoreStaging') {
+            Check (Test-Path -LiteralPath $boundaryMarker) 'staging crash leaves current destination bytes'
+            Check ($boundaryStages.Count -eq 1 -and $boundaryBackups.Count -eq 0) 'staging crash leaves one staged copy and no backup'
+            $out = Invoke-Migrate @('-Phase', 'RestoreSnapshot', '-Agent', 'claude', '-SnapshotPath', $crashSnapshot, '-ConfirmAgentsStopped', '-ApproveSnapshotRestore', '-DriveLetter', $rootLetter) -ExpectFailure
+            Check-Text $out 'incomplete staging' 'restore refuses to overwrite orphaned staging'
+            $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter)
+            Check-Text $out 'Restore reconciliation complete' 'staging crash can be reconciled'
+            Check (Test-Path -LiteralPath $boundaryMarker) 'staging reconciliation preserves the current destination'
+            $savedStages = @(Get-ChildItem -LiteralPath (Join-Path $root 'migration\restore-reconciliation') -Directory -Recurse | Where-Object { $_.Name -eq ('staging-' + $boundaryStages[0].Name) })
+            Check ($savedStages.Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $savedStages[0].FullName 'crash.txt'))) 'staging reconciliation preserves staged snapshot bytes'
+        } else {
+            Check (Test-Path -LiteralPath (Join-Path $claudeDest 'crash.txt')) 'install crash leaves restored snapshot in destination'
+            Check ($boundaryStages.Count -eq 0 -and $boundaryBackups.Count -eq 1) 'install crash leaves the original backup'
+            Check (Test-Path -LiteralPath (Join-Path $boundaryBackups[0].FullName 'pre-restore-boundary.txt')) 'install crash backup preserves original destination bytes'
+            $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter)
+            Check-Text $out 'Restore reconciliation complete' 'install crash can be reconciled'
+            Check (Test-Path -LiteralPath (Join-Path $claudeDest 'crash.txt')) 'install reconciliation preserves the installed destination'
+            $savedBackups = @(Get-ChildItem -LiteralPath (Join-Path $root 'migration\restore-reconciliation') -Directory -Recurse | Where-Object { $_.Name -eq ('backup-' + $boundaryBackups[0].Name) })
+            Check ($savedBackups.Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $savedBackups[0].FullName 'pre-restore-boundary.txt'))) 'install reconciliation preserves backup bytes'
+            Remove-Item -LiteralPath (Join-Path $claudeDest 'crash.txt') -Force
+        }
+        if (Test-Path -LiteralPath $boundaryMarker) { Remove-Item -LiteralPath $boundaryMarker -Force }
+        Check (-not (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json'))) "$boundaryName recovery releases the lease"
+        $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+        Check-Text $out 'manifest matches disk' "$boundaryName status agrees after recovery"
+    }
+
     # Crash after renaming the destination away but before installing the staged snapshot.
     $savedFailpoint = $env:ADM_TEST_FAILPOINT
     $env:ADM_TEST_FAILPOINT = 'AfterDestinationRename'
@@ -780,12 +1243,85 @@ try {
     Check-Text $out 'stranded pre-restore destination' 'restore refuses until the destination is reconciled'
     Check (-not (Test-Path -LiteralPath $claudeDest)) 'refused restore leaves the destination stranded'
     Check (Test-Path -LiteralPath $strandedDest) 'refused restore leaves the stranded backup intact'
-    Rename-Item -LiteralPath $strandedDest -NewName (Split-Path $claudeDest -Leaf)
+    $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-DriveLetter', $rootLetter, '-WhatIf')
+    Check-Text $out 'would restore stranded destination' 'reconciliation previews the destination recovery'
+    Check-Text $out 'would preserve staging' 'reconciliation previews staging preservation'
+    Check (Test-Path -LiteralPath $strandedDest) 'reconciliation preview leaves the backup'
+    Check (Test-Path -LiteralPath $restoreStaging[0].FullName) 'reconciliation preview leaves staging'
+    Check (-not (Test-Path -LiteralPath $claudeDest)) 'reconciliation preview leaves the destination absent'
+    $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'ConfirmAgentsStopped' 'reconciliation requires stopped agents'
+    $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'ApproveRestoreReconciliation' 'reconciliation requires explicit approval'
+    $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'all', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Select one agent' 'reconciliation requires one agent'
+    $activeLease = [pscustomobject]@{ pid=$PID; host=[Environment]::MachineName; agent='claude'; startedUtc=[DateTime]::UtcNow.ToString('o'); staging=''; snapshot='' }
+    $activeLease | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json')
+    $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Snapshot operation already in progress' 'reconciliation refuses an active lease'
+    Remove-Item -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json') -Force
+    $extraBackup = $claudeDest + '.pre-restore-extra'
+    Add-File (Join-Path $extraBackup 'newer.txt') 'do not discard'
+    $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'not exactly one stranded backup' 'reconciliation refuses an ambiguous missing destination'
+    Check (Test-Path -LiteralPath (Join-Path $extraBackup 'newer.txt')) 'ambiguous reconciliation keeps the other backup'
+    Check (Test-Path -LiteralPath $strandedDest) 'ambiguous reconciliation keeps the stranded destination'
+    Remove-Item -LiteralPath $extraBackup -Recurse -Force
+    $referenceManifest = Read-Manifest
+    $referenceEntry = @($referenceManifest.entries | Where-Object { $_.id -eq 'cursor' })[0]
+    $savedCursorSnapshots = @($referenceEntry.destinationSnapshots)
+    $referenceEntry.destinationSnapshots = @($savedCursorSnapshots + @([pscustomobject]@{path=$strandedDest}))
+    [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json -InputObject $referenceManifest -Depth 20), (New-Object Text.UTF8Encoding($false)))
+    $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'overlaps a snapshot reference' 'reconciliation refuses a referenced stranded backup'
+    Check (Test-Path -LiteralPath $strandedDest) 'referenced backup stays in place'
+    $referenceManifest = Read-Manifest
+    $referenceEntry = @($referenceManifest.entries | Where-Object { $_.id -eq 'cursor' })[0]
+    $referenceEntry.destinationSnapshots = @($savedCursorSnapshots)
+    [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json -InputObject $referenceManifest -Depth 20), (New-Object Text.UTF8Encoding($false)))
+    $reconcileTarget = Join-Path $runRoot 'reconcile-tamper-target'
+    New-Item -ItemType Directory -Path $reconcileTarget -Force | Out-Null
+    $reconcileJunction = Join-Path $restoreStaging[0].FullName 'reconcile-junction'
+    New-Item -ItemType Junction -Path $reconcileJunction -Target $reconcileTarget | Out-Null
+    $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'Refusing tree containing reparse point' 'reconciliation refuses reparse points in staging'
+    Check (Test-Path -LiteralPath $strandedDest) 'reparse refusal leaves the backup in place'
+    [IO.Directory]::Delete($reconcileJunction)
+    Remove-Item -LiteralPath $reconcileTarget -Force
+    $savedFailpoint = $env:ADM_TEST_FAILPOINT
+    $env:ADM_TEST_FAILPOINT = 'AfterReconcilePreserve'
+    try {
+        $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode 93 -UseScript $crashScriptPath
+    } finally {
+        if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+    }
+    $quarantineRoot = Join-Path $root 'migration\restore-reconciliation'
+    $preservedStages = @(Get-ChildItem -LiteralPath $quarantineRoot -Directory -Recurse | Where-Object { $_.Name -eq ('staging-' + $restoreStaging[0].Name) })
+    Check ($preservedStages.Count -eq 1) 'interrupted reconciliation preserves staging before recovery'
+    Check (Test-Path -LiteralPath $strandedDest) 'interrupted reconciliation leaves the destination backup'
+    Check (-not (Test-Path -LiteralPath $claudeDest)) 'interrupted reconciliation does not invent a destination'
+    $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Restore reconciliation complete' 'approved reconciliation resumes after a crash'
     Check (Test-Path -LiteralPath (Join-Path $claudeDest 'settings.json')) 'reconciled destination is back in place'
-    $out = Invoke-Migrate @('-Phase', 'RestoreSnapshot', '-Agent', 'claude', '-SnapshotPath', $crashSnapshot, '-ConfirmAgentsStopped', '-ApproveSnapshotRestore', '-DriveLetter', $rootLetter) -ExpectFailure
-    Check-Text $out 'incomplete staging' 'restore refuses while staged data remains'
-    Remove-Item -LiteralPath $restoreStaging[0].FullName -Recurse -Force
-    Check (-not (Test-Path -LiteralPath $restoreStaging[0].FullName)) 'reconciled restore staging is removed'
+    Check (-not (Test-Path -LiteralPath $restoreStaging[0].FullName)) 'reconciled restore staging leaves the active location'
+    $quarantineRoot = Join-Path $root 'migration\restore-reconciliation'
+    $preservedStages = @(Get-ChildItem -LiteralPath $quarantineRoot -Directory -Recurse | Where-Object { $_.Name -eq ('staging-' + $restoreStaging[0].Name) })
+    Check ($preservedStages.Count -eq 1) 'reconciliation retains staging for review'
+    Check (Test-Path -LiteralPath (Join-Path $preservedStages[0].FullName 'crash.txt')) 'preserved staging retains its data'
+    Check (-not (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json'))) 'reconciliation releases the lease'
+
+    Add-File (Join-Path $claudeDest 'newer-live.txt') 'newer destination data'
+    $backupWithDestination = $claudeDest + '.pre-restore-review'
+    Add-File (Join-Path $backupWithDestination 'newer-backup.txt') 'backup data'
+    $stagingWithDestination = Join-Path $rollbacksRoot '.restore-claude-review'
+    Add-File (Join-Path $stagingWithDestination 'partial.txt') 'staging data'
+    $out = Invoke-Migrate @('-Phase', 'ReconcileRestore', '-Agent', 'claude', '-ConfirmAgentsStopped', '-ApproveRestoreReconciliation', '-DriveLetter', $rootLetter)
+    Check (Test-Path -LiteralPath (Join-Path $claudeDest 'newer-live.txt')) 'reconciliation preserves the existing destination'
+    $savedBackup = @(Get-ChildItem -LiteralPath $quarantineRoot -Directory -Recurse | Where-Object { $_.Name -eq 'backup-claude.pre-restore-review' })
+    $savedStage = @(Get-ChildItem -LiteralPath $quarantineRoot -Directory -Recurse | Where-Object { $_.Name -eq 'staging-.restore-claude-review' })
+    Check ($savedBackup.Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $savedBackup[0].FullName 'newer-backup.txt'))) 'reconciliation preserves the stranded backup when destination exists'
+    Check ($savedStage.Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $savedStage[0].FullName 'partial.txt'))) 'reconciliation preserves additional staging when destination exists'
+    Remove-Item -LiteralPath (Join-Path $claudeDest 'newer-live.txt') -Force
 
     $out = Invoke-Migrate @('-Phase', 'RestoreSnapshot', '-Agent', 'claude', '-SnapshotPath', $crashSnapshot, '-DriveLetter', $rootLetter, '-WhatIf')
     Check-Text $out 'would restore' 'restore previews without approval'
@@ -979,6 +1515,9 @@ try {
     [IO.File]::WriteAllText($manifestPath, 'not json')
     $out = Invoke-Migrate @('-Phase', 'Status', '-DriveLetter', $rootLetter)
     Check-Text $out 'Manifest unreadable; loading backup' 'status falls back to the manifest backup'
+    $out = Invoke-Migrate @('-Phase', 'Verify', '-Agent', 'claude', '-DriveLetter', $rootLetter) -ExpectFailure
+    Check-Text $out 'reconcile the primary manifest before writing' 'writer refuses to update from the backup'
+    Check ([IO.File]::ReadAllText($manifestPath) -eq 'not json') 'backup refusal preserves the unreadable primary'
     [IO.File]::WriteAllText($manifestPath, $savedManifestText)
     $out = Invoke-Migrate @('-Phase', 'Status', '-DriveLetter', $rootLetter)
     Check-Text $out 'manifest matches disk' 'status agrees after restoring the manifest'
