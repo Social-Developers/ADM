@@ -83,14 +83,8 @@ function Find-TreeReparsePoint([string]$Path) {
     return $null
 }
 function Assert-TreeSafe([string]$Path) {
-    Assert-NoReparse $Path
-    if (Test-Path -LiteralPath $Path) {
-        Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction Stop | ForEach-Object {
-            if (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Refusing tree containing reparse point: $($_.FullName)"
-            }
-        }
-    }
+    $reparse = Find-TreeReparsePoint $Path
+    if ($null -ne $reparse) { throw "Refusing tree containing reparse point: $reparse" }
 }
 function Wait-SnapshotFailpoint([string]$Failpoint, [string]$Marker) {
     if ($env:ADM_TEST_FAILPOINT -ne $Failpoint) { return }
