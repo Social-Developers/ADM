@@ -799,6 +799,23 @@ try {
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'manifest matches disk' 'status agrees after the lease window regressions'
 
+    # Restore must reload the manifest after its lease, preserving a phase that finished first.
+    $staleRestoreAdoption = Join-Path $rollbacksRoot 'claude-20260101T000003000Z'
+    Add-File (Join-Path $staleRestoreAdoption 'adopted-during-restore.txt') 'adopted-during-restore'
+    $restoreStaleWindow = Start-Migrate -Arguments @('-Phase', 'RestoreSnapshot', '-Agent', 'claude', '-SnapshotPath', $crashSnapshot, '-ConfirmAgentsStopped', '-ApproveSnapshotRestore', '-DriveLetter', $rootLetter) -Environment @{ ADM_TEST_FAILPOINT = 'BeforeSnapshotLease' }
+    $markerAppeared = Wait-ForFile $staleMarker 30
+    Check $markerAppeared 'restore pauses after loading the manifest'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $staleRestoreAdoption, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Adopted snapshot' 'adoption completes while the restore is paused'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $staleRestoreAdoption }).Count -eq 1) 'adoption is recorded before the paused restore resumes'
+    Set-Content -LiteralPath ($staleMarker + '.release') -Value 'release'
+    $out = Complete-Migrate -Handle $restoreStaleWindow
+    Check (Test-Path -LiteralPath (Join-Path $claudeDest 'crash.txt')) 'paused restore completes after adopting'
+    $afterRestoreReload = Read-Entry 'claude'
+    Check (@($afterRestoreReload.destinationSnapshots | Where-Object { $_.path -eq $staleRestoreAdoption }).Count -eq 1) 'restore reload preserves the newer adoption'
+    Check (-not (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json'))) 'restore releases its lease after the stale-manifest window'
+    Remove-Item -LiteralPath (Join-Path $claudeDest 'crash.txt') -Force
+
     Write-Host ''
     Write-Host '=== cleanup refusals ==='
     New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
