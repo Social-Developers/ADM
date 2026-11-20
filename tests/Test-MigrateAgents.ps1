@@ -145,6 +145,9 @@ try {
     $restoreFailpointNeedle = 'Rename-Item -LiteralPath $e.destination -NewName (Split-Path $backupDest -Leaf) -ErrorAction Stop'
     if (-not $crashText.Contains($restoreFailpointNeedle)) { throw 'Cannot install the restore crash failpoint.' }
     $crashText = $crashText.Replace($restoreFailpointNeedle, $restoreFailpointNeedle + "`n            if (`$env:ADM_TEST_FAILPOINT -eq 'AfterDestinationRename') { [Environment]::Exit(98) }")
+    $pruneFailpointNeedle = 'Move-Item -LiteralPath $full -Destination $deleting -ErrorAction Stop'
+    if (-not $crashText.Contains($pruneFailpointNeedle)) { throw 'Cannot install the prune crash failpoint.' }
+    $crashText = $crashText.Replace($pruneFailpointNeedle, $pruneFailpointNeedle + "`n                if (`$env:ADM_TEST_FAILPOINT -eq 'AfterPruneRename') { [Environment]::Exit(97) }")
     Set-Content -LiteralPath $crashScriptPath -Value $crashText
     Unblock-File -LiteralPath $crashScriptPath
 
@@ -573,6 +576,34 @@ try {
     Check (-not (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json'))) 'prune releases its lease'
     $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
     Check-Text $out 'manifest matches disk' 'status agrees after pruning'
+
+    # A crash after moving a pruned snapshot aside but before the manifest update.
+    $pruneCrash = Join-Path $rollbacksRoot 'claude-20200101T000000000Z'
+    Add-File (Join-Path $pruneCrash 'pending-delete.txt') 'pending deletion'
+    $out = Invoke-Migrate @('-Phase', 'AdoptSnapshots', '-Agent', 'claude', '-SnapshotPath', $pruneCrash, '-ApproveSnapshotAdoption', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Adopted snapshot' 'older snapshot is adopted for the prune crash regression'
+    $savedFailpoint = $env:ADM_TEST_FAILPOINT
+    $env:ADM_TEST_FAILPOINT = 'AfterPruneRename'
+    try {
+        $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter) -ExpectFailure -ExpectedExitCode 97 -UseScript $crashScriptPath
+    } finally {
+        if ($null -eq $savedFailpoint) { Remove-Item Env:ADM_TEST_FAILPOINT -ErrorAction SilentlyContinue } else { $env:ADM_TEST_FAILPOINT = $savedFailpoint }
+    }
+    $pendingDeletions = @(Get-ChildItem -LiteralPath $rollbacksRoot -Directory -Force -Filter '.deleting-*')
+    Check ($pendingDeletions.Count -eq 1) 'prune crash leaves one pending deletion folder'
+    Check (-not (Test-Path -LiteralPath $pruneCrash)) 'prune crash moves the older snapshot aside'
+    Check (@((Read-Entry 'claude').destinationSnapshots | Where-Object { $_.path -eq $pruneCrash }).Count -eq 1) 'prune crash leaves the snapshot in history'
+    Check (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json')) 'prune crash leaves its lease behind'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'Pending snapshot deletion under' 'status reports the pending deletion'
+    Check-Text $out $pendingDeletions[0].Name 'status names the pending deletion folder'
+    $out = Invoke-Migrate @('-Phase', 'PruneSnapshots', '-Agent', 'claude', '-KeepDays', '1', '-ApproveSnapshotDeletion', '-DriveLetter', $rootLetter)
+    Check (-not (Test-Path -LiteralPath $pendingDeletions[0].FullName)) 'recovery prune removes the pending deletion folder'
+    Check ((Read-Entry 'claude').destinationSnapshots.Count -eq 1) 'recovery prune reconciles the snapshot history'
+    Check (Test-Path -LiteralPath $removedEntry.destinationSnapshot) 'recovery prune keeps the latest snapshot'
+    Check (-not (Test-Path -LiteralPath (Join-Path $rollbacksRoot '.snapshot-lease.json'))) 'recovery prune releases its lease'
+    $out = Invoke-Migrate @('-Phase', 'Status', '-Agent', 'claude', '-DriveLetter', $rootLetter)
+    Check-Text $out 'manifest matches disk' 'status agrees after the prune crash recovery'
 
     Set-Content -LiteralPath $claudeSettings -Value '{"theme":"dark"}'
     $out = Invoke-Migrate @('-Phase', 'Activate', '-Agent', 'claude', '-ConfirmAgentsStopped', '-DriveLetter', $rootLetter)
